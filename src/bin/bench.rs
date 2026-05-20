@@ -23,7 +23,7 @@ use lez_signature_bench_methods::{
     ECDSA_P256_ELF, ECDSA_SECP256K1_ELF, ED25519_ELF, LMS_ELF, NOOP_ELF, SCHNORR_SECP256K1_ELF,
 };
 use nssa::{AccountId, program::Program};
-use risc0_zkvm::{ExecutorEnv, default_prover};
+use risc0_zkvm::{ExecutorEnv, default_prover, default_executor};
 use serde::{Deserialize, Serialize};
 use wallet::{PrivacyPreservingAccount, WalletCore};
 
@@ -53,6 +53,9 @@ struct Cli {
     /// File suffix for output files in --all mode (e.g. "e2e" → results-e2e.json).
     #[arg(long)]
     label: Option<String>,
+    /// Run the bench in public execution (default is private execution)
+    #[arg(long, default_value = "false")]
+    public: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -99,26 +102,53 @@ fn build_local_env<'a>(input: &'a VerifyInput) -> ExecutorEnv<'a> {
         .unwrap()
 }
 
-fn run_local(label: &str, n: usize, elf: &'static [u8], input: &VerifyInput) -> Row {
+fn run_local(label: &str, n: usize, elf: &'static [u8], input: &VerifyInput, public: bool) -> Row {
     let env = build_local_env(input);
     let t0 = Instant::now();
-    let prove_info = default_prover().prove(env, elf).expect("prove");
-    let prove_seconds = t0.elapsed().as_secs_f64();
-    let receipt_bytes = bincode::serialize(&prove_info.receipt)
-        .expect("receipt bincode")
-        .len();
-    let stats = &prove_info.stats;
-    Row {
-        scheme: label.to_string(),
-        n,
-        total_cycles: Some(stats.total_cycles),
-        user_cycles: Some(stats.user_cycles),
-        paging_cycles: Some(stats.paging_cycles),
-        segments: Some(stats.segments),
-        prove_seconds: Some(prove_seconds),
-        receipt_bytes: Some(receipt_bytes),
-        tx_e2e_seconds: None,
+
+    match public {
+        true => {
+            let session = default_executor().execute(env, elf).expect("execute");
+            let prove_seconds = t0.elapsed().as_secs_f64();
+            let stats = &session;
+
+            Row {
+                scheme: label.to_string(),
+                n,
+                total_cycles: Some(stats.cycles()),
+                user_cycles: Some(0),
+                paging_cycles: Some(0),
+                segments: Some(stats.segments.len()),
+                prove_seconds: Some(prove_seconds),
+                receipt_bytes: Some(0),
+                tx_e2e_seconds: None,
+            }
+        },
+        false => {
+
+            let prove_info = default_prover().prove(env, elf).expect("prove");
+            let prove_seconds = t0.elapsed().as_secs_f64();
+            let receipt_bytes = bincode::serialize(&prove_info.receipt)
+                .expect("receipt bincode")
+                .len();
+            let stats = &prove_info.stats;
+
+            Row {
+                scheme: label.to_string(),
+                n,
+                total_cycles: Some(stats.total_cycles),
+                user_cycles: Some(stats.user_cycles),
+                paging_cycles: Some(stats.paging_cycles),
+                segments: Some(stats.segments),
+                prove_seconds: Some(prove_seconds),
+                receipt_bytes: Some(receipt_bytes),
+                tx_e2e_seconds: None,
+            }
+        }
     }
+
+
+
 }
 
 async fn run_e2e(
@@ -260,7 +290,7 @@ async fn main() {
         let row = if let (Some(wallet), Some(aid)) = (wallet_core.as_ref(), account_id) {
             run_e2e("noop", 1, NOOP_ELF, &baseline_input, aid, wallet).await
         } else {
-            run_local("noop", 1, NOOP_ELF, &baseline_input)
+            run_local("noop", 1, NOOP_ELF, &baseline_input, cli.public)
         };
         print_row(&row);
         rows.push(row);
@@ -272,7 +302,7 @@ async fn main() {
                 let row = if let (Some(wallet), Some(aid)) = (wallet_core.as_ref(), account_id) {
                     run_e2e(scheme.slug(), n, elf, &input, aid, wallet).await
                 } else {
-                    run_local(scheme.slug(), n, elf, &input)
+                    run_local(scheme.slug(), n, elf, &input, cli.public)
                 };
                 print_row(&row);
                 rows.push(row);
@@ -305,7 +335,7 @@ async fn main() {
         let row = if let (Some(wallet), Some(aid)) = (wallet_core.as_ref(), account_id) {
             run_e2e(&label, n, elf, &input, aid, wallet).await
         } else {
-            run_local(&label, n, elf, &input)
+            run_local(&label, n, elf, &input, cli.public)
         };
         print_row(&row);
     }
