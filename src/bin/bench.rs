@@ -1,12 +1,21 @@
-//! Bench harness for signature schemes inside an NSSA-wrapped LEZ guest.
+//! Bench harness for signature schemes inside a LEZ actor-model guest.
+//!
+//! Targets LEZ `dev` (the v0.4 actor model): each guest is an
+//! `actor_entrypoint!` handler that receives one borsh-encoded `VerifyInput`
+//! message and returns `Response::keep_state()`.
 //!
 //! Two modes:
 //!
 //! * **Local prove** (default): proves locally via
-//!   `risc0_zkvm::default_prover()`. Records cycles, prove time, receipt size.
-//! * **End-to-end private TX** (`--account-id <id>`): submits a real
-//!   privacy-preserving transaction via `wallet::WalletCore::send_privacy_preserving_tx`
-//!   against a running localnet. Records wall-clock end-to-end time.
+//!   `risc0_zkvm::default_prover()`, feeding the guest the same borsh-framed
+//!   `ReceiveInput` the LEZ engine writes. Records cycles, prove time,
+//!   receipt size.
+//! * **End-to-end private TX** (`--account-id <id> --payer <id>`, needs the
+//!   `e2e` feature): deploys each guest through the program loader (fee paid
+//!   by `--payer`), then submits a real privacy-preserving transaction via
+//!   `wallet::WalletCore::send_privacy_preserving_tx` against a running
+//!   sequencer. Records wall-clock end-to-end time of the transaction only
+//!   (the deploy is not timed).
 //!
 //! `--all` runs the full (scheme × N) matrix plus the noop calibration
 //! baseline. Output goes to `results/results.json` and
@@ -18,17 +27,15 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
-use lez_signature_bench::{Scheme, VerifyInput, make_test_vector};
+use lez_signature_bench::{Scheme, VerifyInput, guest_input_frame, make_test_vector};
 use lez_signature_bench_methods::{
     ECDSA_P256_ELF, ECDSA_SECP256K1_ELF, ED25519_ELF, LMS_ELF, NOOP_ELF, SCHNORR_SECP256K1_ELF,
 };
-use nssa::{AccountId, program::Program};
 use risc0_zkvm::{ExecutorEnv, default_prover};
 use serde::{Deserialize, Serialize};
-use wallet::{PrivacyPreservingAccount, WalletCore};
 
 #[derive(Parser, Debug)]
-#[command(about = "Bench across signature schemes inside an NSSA-wrapped LEZ guest.")]
+#[command(about = "Bench across signature schemes inside a LEZ actor-model guest.")]
 struct Cli {
     /// Scheme slug (ecdsa-secp256k1 | schnorr-secp256k1 | ed25519 | ecdsa-p256 | lms | noop). Ignored with --all.
     #[arg(long)]
@@ -47,9 +54,13 @@ struct Cli {
     out_dir: PathBuf,
     /// PrivateOwned account id (e.g. `Private/...`) for end-to-end TX mode.
     /// When set, the bench submits real privacy-preserving TXs instead of
-    /// proving locally. Requires a running localnet and `WalletCore::from_env()`.
+    /// proving locally. Requires a running sequencer and `WalletCore::from_env()`.
     #[arg(long)]
     account_id: Option<String>,
+    /// Funded public account (e.g. `Public/...`) that pays the program-loader
+    /// deploy fees in end-to-end mode.
+    #[arg(long)]
+    payer: Option<String>,
     /// File suffix for output files in --all mode (e.g. "e2e" → results-e2e.json).
     #[arg(long)]
     label: Option<String>,
@@ -80,23 +91,11 @@ fn elf_for(scheme: Scheme) -> &'static [u8] {
     }
 }
 
-fn build_local_env<'a>(input: &'a VerifyInput) -> ExecutorEnv<'a> {
-    let self_program_id: [u32; 8] = [0; 8];
-    let caller_program_id: Option<[u32; 8]> = None;
-    let pre_states: Vec<nssa_core::account::AccountWithMetadata> = Vec::new();
-    let instruction_data: Vec<u32> = risc0_zkvm::serde::to_vec(input).expect("encode VerifyInput");
-
+fn build_local_env(input: &VerifyInput) -> ExecutorEnv<'static> {
     ExecutorEnv::builder()
-        .write(&self_program_id)
-        .unwrap()
-        .write(&caller_program_id)
-        .unwrap()
-        .write(&pre_states)
-        .unwrap()
-        .write(&instruction_data)
-        .unwrap()
+        .write_slice(&guest_input_frame(input))
         .build()
-        .unwrap()
+        .expect("build ExecutorEnv")
 }
 
 fn run_local(label: &str, n: usize, elf: &'static [u8], input: &VerifyInput) -> Row {
@@ -121,35 +120,96 @@ fn run_local(label: &str, n: usize, elf: &'static [u8], input: &VerifyInput) -> 
     }
 }
 
-async fn run_e2e(
-    label: &str,
-    n: usize,
-    elf: &'static [u8],
-    input: &VerifyInput,
-    account_id: AccountId,
-    wallet_core: &WalletCore,
-) -> Row {
-    let program = Program::new(elf.to_vec()).expect("parse program");
-    let serialized = Program::serialize_instruction(input.clone()).expect("serialize VerifyInput");
-    let accounts = vec![PrivacyPreservingAccount::PrivateOwned(account_id)];
+#[cfg(feature = "e2e")]
+mod e2e {
+    use std::time::Instant;
 
-    let t0 = Instant::now();
-    wallet_core
-        .send_privacy_preserving_tx(accounts, serialized, &program.into())
-        .await
-        .expect("send_privacy_preserving_tx");
-    let elapsed = t0.elapsed().as_secs_f64();
+    use lee::{
+        AccountId, privacy_preserving_transaction::circuit::ProgramCatalog, program::Program,
+    };
+    use lez_signature_bench::VerifyInput;
+    use program_loader_core::MAX_SEGMENT_DATA_LEN;
+    use wallet::{
+        AccountIdentity, WalletCore, WalletSequencerClient,
+        program_facades::program_loader::ProgramLoader,
+    };
 
-    Row {
-        scheme: label.to_string(),
-        n,
-        total_cycles: None,
-        user_cycles: None,
-        paging_cycles: None,
-        segments: None,
-        prove_seconds: None,
-        receipt_bytes: None,
-        tx_e2e_seconds: Some(elapsed),
+    use super::Row;
+
+    pub struct Deployed {
+        pub program_account_id: AccountId,
+        pub programs: ProgramCatalog,
+    }
+
+    pub fn parse_account_id(s: &str) -> AccountId {
+        s.strip_prefix("Private/")
+            .or_else(|| s.strip_prefix("Public/"))
+            .unwrap_or(s)
+            .parse()
+            .expect("parse account id")
+    }
+
+    /// Deploys `elf` through `program_loader` into fresh header + segment
+    /// accounts, paid by `payer`. Mirrors LEZ's
+    /// `examples/program_deployment/src/lib.rs::deploy_program`.
+    pub async fn deploy<C: WalletSequencerClient>(
+        wallet: &mut WalletCore<C>,
+        elf: &'static [u8],
+        payer: AccountId,
+    ) -> Deployed {
+        let bytecode = elf.to_vec();
+        let segment_count = risc0_binfmt::ProgramBinary::decode(&bytecode)
+            .expect("program binary")
+            .user_elf
+            .len()
+            .div_ceil(MAX_SEGMENT_DATA_LEN);
+        let header = wallet.create_new_account_public(None).0;
+        let segments: Vec<AccountId> =
+            std::iter::repeat_with(|| wallet.create_new_account_public(None).0)
+                .take(segment_count)
+                .collect();
+        wallet.store_persistent_data().expect("store wallet");
+        let program_account_id = ProgramLoader(&*wallet)
+            .deploy(header, &segments, bytecode, true, Some(payer))
+            .await
+            .expect("program-loader deploy");
+        let program = Program::new(elf.into()).expect("parse program");
+        Deployed {
+            program_account_id,
+            programs: ProgramCatalog::from_iter([(program_account_id, program)]),
+        }
+    }
+
+    pub async fn run<C: WalletSequencerClient>(
+        label: &str,
+        n: usize,
+        deployed: &Deployed,
+        input: &VerifyInput,
+        account_id: AccountId,
+        wallet: &WalletCore<C>,
+    ) -> Row {
+        let message = Program::serialize_message(input.clone()).expect("serialize VerifyInput");
+        let account = AccountIdentity::PrivateOwned(account_id)
+            .select_program_actor_state(deployed.program_account_id);
+
+        let t0 = Instant::now();
+        wallet
+            .send_privacy_preserving_tx(vec![account], 0, message, &deployed.programs)
+            .await
+            .expect("send_privacy_preserving_tx");
+        let elapsed = t0.elapsed().as_secs_f64();
+
+        Row {
+            scheme: label.to_string(),
+            n,
+            total_cycles: None,
+            user_cycles: None,
+            paging_cycles: None,
+            segments: None,
+            prove_seconds: None,
+            receipt_bytes: None,
+            tx_e2e_seconds: Some(elapsed),
+        }
     }
 }
 
@@ -229,12 +289,92 @@ fn write_outputs(rows: &[Row], out_dir: &PathBuf, label: Option<&str>, e2e: bool
     );
 }
 
-fn parse_account_id(s: &str) -> AccountId {
-    s.strip_prefix("Private/")
-        .or_else(|| s.strip_prefix("Public/"))
-        .unwrap_or(s)
-        .parse()
-        .expect("parse account_id")
+/// The (label, n, ELF, fixture) points to run: one, or the full matrix.
+fn cases(cli: &Cli) -> Vec<(String, usize, &'static [u8], VerifyInput)> {
+    if cli.all {
+        let mut cases = vec![(
+            "noop".to_string(),
+            1,
+            NOOP_ELF,
+            make_test_vector(Scheme::EcdsaSecp256k1, 1),
+        )];
+        for &scheme in Scheme::ALL {
+            for &n in &cli.ns {
+                cases.push((
+                    scheme.slug().to_string(),
+                    n,
+                    elf_for(scheme),
+                    make_test_vector(scheme, n),
+                ));
+            }
+        }
+        return cases;
+    }
+    let scheme_str = cli
+        .scheme
+        .as_deref()
+        .expect("--scheme required without --all");
+    let n = cli.n.expect("--n required without --all");
+    if scheme_str == "noop" {
+        vec![(
+            "noop".to_string(),
+            n,
+            NOOP_ELF,
+            make_test_vector(Scheme::EcdsaSecp256k1, n),
+        )]
+    } else {
+        let scheme = Scheme::parse(scheme_str).expect("scheme");
+        vec![(
+            scheme.slug().to_string(),
+            n,
+            elf_for(scheme),
+            make_test_vector(scheme, n),
+        )]
+    }
+}
+
+#[cfg(feature = "e2e")]
+async fn run_e2e_cases(
+    cli: &Cli,
+    cases: &[(String, usize, &'static [u8], VerifyInput)],
+) -> Vec<Row> {
+    let account_id = e2e::parse_account_id(cli.account_id.as_deref().expect("--account-id"));
+    let payer = e2e::parse_account_id(
+        cli.payer
+            .as_deref()
+            .expect("--payer <funded public account> required with --account-id"),
+    );
+    let mut wallet =
+        wallet::WalletCore::from_env().expect("WalletCore from env (set LEE_WALLET_HOME_DIR)");
+
+    // Deploy each distinct guest once, before any timed transaction.
+    let mut deployed: Vec<(&'static [u8], e2e::Deployed)> = Vec::new();
+    for (label, _, elf, _) in cases {
+        if !deployed.iter().any(|(e, _)| std::ptr::eq(*e, *elf)) {
+            eprintln!("deploying {label} …");
+            deployed.push((elf, e2e::deploy(&mut wallet, elf, payer).await));
+        }
+    }
+
+    let mut rows = Vec::new();
+    for (label, n, elf, input) in cases {
+        let (_, d) = deployed
+            .iter()
+            .find(|(e, _)| std::ptr::eq(*e, *elf))
+            .expect("deployed");
+        let row = e2e::run(label, *n, d, input, account_id, &wallet).await;
+        print_row(&row);
+        rows.push(row);
+    }
+    rows
+}
+
+#[cfg(not(feature = "e2e"))]
+async fn run_e2e_cases(
+    _cli: &Cli,
+    _cases: &[(String, usize, &'static [u8], VerifyInput)],
+) -> Vec<Row> {
+    panic!("--account-id needs the `e2e` feature (build without --no-default-features)");
 }
 
 #[tokio::main]
@@ -246,67 +386,21 @@ async fn main() {
     }
 
     let e2e = cli.account_id.is_some();
-    let wallet_core = if e2e {
-        Some(WalletCore::from_env().expect("WalletCore from env (set NSSA_WALLET_HOME_DIR)"))
+    let cases = cases(&cli);
+    let rows = if e2e {
+        run_e2e_cases(&cli, &cases).await
     } else {
-        None
+        cases
+            .iter()
+            .map(|(label, n, elf, input)| {
+                let row = run_local(label, *n, elf, input);
+                print_row(&row);
+                row
+            })
+            .collect()
     };
-    let account_id = cli.account_id.as_deref().map(parse_account_id);
 
     if cli.all {
-        let mut rows: Vec<Row> = Vec::new();
-
-        let baseline_input = make_test_vector(Scheme::EcdsaSecp256k1, 1);
-        let row = if let (Some(wallet), Some(aid)) = (wallet_core.as_ref(), account_id) {
-            run_e2e("noop", 1, NOOP_ELF, &baseline_input, aid, wallet).await
-        } else {
-            run_local("noop", 1, NOOP_ELF, &baseline_input)
-        };
-        print_row(&row);
-        rows.push(row);
-
-        for &scheme in Scheme::ALL {
-            let elf = elf_for(scheme);
-            for &n in &cli.ns {
-                let input = make_test_vector(scheme, n);
-                let row = if let (Some(wallet), Some(aid)) = (wallet_core.as_ref(), account_id) {
-                    run_e2e(scheme.slug(), n, elf, &input, aid, wallet).await
-                } else {
-                    run_local(scheme.slug(), n, elf, &input)
-                };
-                print_row(&row);
-                rows.push(row);
-            }
-        }
-
         write_outputs(&rows, &cli.out_dir, cli.label.as_deref(), e2e);
-    } else {
-        let scheme_str = cli
-            .scheme
-            .as_deref()
-            .expect("--scheme required without --all");
-        let n = cli.n.expect("--n required without --all");
-
-        let (label, elf, input) = if scheme_str == "noop" {
-            (
-                "noop".to_string(),
-                NOOP_ELF,
-                make_test_vector(Scheme::EcdsaSecp256k1, n),
-            )
-        } else {
-            let scheme = Scheme::parse(scheme_str).expect("scheme");
-            (
-                scheme.slug().to_string(),
-                elf_for(scheme),
-                make_test_vector(scheme, n),
-            )
-        };
-
-        let row = if let (Some(wallet), Some(aid)) = (wallet_core.as_ref(), account_id) {
-            run_e2e(&label, n, elf, &input, aid, wallet).await
-        } else {
-            run_local(&label, n, elf, &input)
-        };
-        print_row(&row);
     }
 }

@@ -27,25 +27,29 @@ panic = "abort"
 strip = true
 
 [workspace.dependencies]
-nssa = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.2.0-rc3" }
-nssa_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.2.0-rc3" }
-wallet = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.2.0-rc3" }
-common = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.2.0-rc3" }
-sequencer_service_rpc = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.2.0-rc3" }
+# LEZ `dev` (the v0.4 actor model, PR #935). There is no `master`; `main`
+# predates the actor model. Pinned by rev so the numbers are reproducible.
+lee = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", rev = "dcbd318f0f2ef601fc93e67e0dabc49895d811ef" }
+lee_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", rev = "dcbd318f0f2ef601fc93e67e0dabc49895d811ef" }
+program_loader_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", rev = "dcbd318f0f2ef601fc93e67e0dabc49895d811ef" }
+wallet = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", rev = "dcbd318f0f2ef601fc93e67e0dabc49895d811ef" }
 
-risc0-zkvm = { version = "3.0.5", features = ["std"] }
-risc0-build = "3.0.5"
+risc0-zkvm = { version = "3.1.0", features = ["std"] }
+risc0-build = "3.0.7"
+risc0-binfmt = "3.0.6"
+borsh = { version = "1.5.7", features = ["derive"] }
+anyhow = "1.0.98"
 
 serde = { version = "1.0.228", features = ["derive"] }
 hex = "0.4.3"
 sha2 = { version = "0.10", default-features = false }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "schnorr", "std"] }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
-ed25519-dalek = { version = "=2.1.1", default-features = false, features = ["std"] }
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
 hbs-lms = { version = "0.2.0-alpha.1", default-features = false }
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 clap = { version = "4.5", features = ["derive"] }
-tokio = { version = "1.28", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.50", features = ["macros", "rt-multi-thread"] }
 serde_json = "1.0"
 
 [patch.crates-io]
@@ -55,17 +59,28 @@ p256 = { git = "https://github.com/risc0/RustCrypto-elliptic-curves", tag = "p25
 crypto-bigint = { git = "https://github.com/risc0/RustCrypto-crypto-bigint", tag = "v0.5.5-risczero.0" }
 tiny-keccak = { git = "https://github.com/risc0/tiny-keccak", tag = "tiny-keccak/v2.0.2-risczero.0" }
 curve25519-dalek = { git = "https://github.com/risc0/curve25519-dalek", tag = "curve25519-4.1.3-risczero.0" }
-ed25519-dalek = { git = "https://github.com/risc0/curve25519-dalek", tag = "curve25519-4.1.3-risczero.0" }
+# Mirrors LEZ `dev`'s own [patch.crates-io] (patches of a git dependency are
+# not inherited, so the root workspace has to repeat them).
+keccak = { git = "https://github.com/logos-blockchain/sponges", rev = "3a56e99771beedf04946eab21a4a62adc2951377" }
+
+[features]
+default = ["e2e"]
+# End-to-end private-TX mode (`bench --account-id`). Pulls in the LEZ wallet
+# and its whole dependency tree; build with `--no-default-features` for the
+# local-prove bench only.
+e2e = ["dep:lee", "dep:wallet", "dep:program_loader_core", "dep:risc0-binfmt", "dep:anyhow"]
 
 [dependencies]
 lez_signature_bench_methods = { path = "methods" }
-nssa.workspace = true
-nssa_core.workspace = true
-wallet.workspace = true
-common.workspace = true
-sequencer_service_rpc = { workspace = true, features = ["client"] }
+lee_core = { workspace = true, features = ["host"] }
+lee = { workspace = true, optional = true }
+wallet = { workspace = true, optional = true }
+program_loader_core = { workspace = true, optional = true }
+risc0-binfmt = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
 
 risc0-zkvm.workspace = true
+borsh.workspace = true
 serde.workspace = true
 hex.workspace = true
 k256 = { workspace = true, features = ["arithmetic"] }
@@ -78,3 +93,6 @@ clap.workspace = true
 tokio.workspace = true
 bincode = "1.3"
 serde_json.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
