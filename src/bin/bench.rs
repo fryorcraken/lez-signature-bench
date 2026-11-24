@@ -26,6 +26,7 @@ use clap::Parser;
 use lez_signature_bench::{Scheme, VerifyInput, make_test_vector};
 use lez_signature_bench_methods::{
     ECDSA_P256_ELF, ECDSA_SECP256K1_ELF, ED25519_ELF, LMS_ELF, NOOP_ELF, SCHNORR_SECP256K1_ELF,
+    XMSS_ELF,
 };
 use nssa::{AccountId, program::Program};
 use risc0_zkvm::{ExecutorEnv, default_executor, default_prover};
@@ -35,7 +36,7 @@ use wallet::{PrivacyPreservingAccount, WalletCore};
 #[derive(Parser, Debug)]
 #[command(about = "Bench across signature schemes inside an NSSA-wrapped LEZ guest.")]
 struct Cli {
-    /// Scheme slug (ecdsa-secp256k1 | schnorr-secp256k1 | ed25519 | ecdsa-p256 | lms | noop). Ignored with --all.
+    /// Scheme slug (ecdsa-secp256k1 | schnorr-secp256k1 | ed25519 | ecdsa-p256 | lms | lms-w1 | xmss | noop). Ignored with --all.
     #[arg(long)]
     scheme: Option<String>,
     /// Number of signers in the synthetic fixture. Ignored with --all.
@@ -101,7 +102,10 @@ fn elf_for(scheme: Scheme) -> &'static [u8] {
         Scheme::SchnorrSecp256k1 => SCHNORR_SECP256K1_ELF,
         Scheme::Ed25519 => ED25519_ELF,
         Scheme::EcdsaP256 => ECDSA_P256_ELF,
-        Scheme::Lms => LMS_ELF,
+        // hbs-lms reads the LM-OTS / LMS type codes from the signature, so
+        // the same guest verifies every LMS parameter set.
+        Scheme::Lms | Scheme::LmsW1 => LMS_ELF,
+        Scheme::Xmss => XMSS_ELF,
     }
 }
 

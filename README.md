@@ -29,7 +29,9 @@ See [`SPEC.md`](./SPEC.md) for acceptance criteria and
 | Schnorr secp256k1 (BIP-340) | secp256k1 | sha256 | (same fork as ECDSA) |
 | Ed25519 | Curve25519 | none (sha512 internal) | `curve25519-4.1.3-risczero.0` |
 | ECDSA P-256 | NIST P-256 | sha256 | `p256/v0.13.2-risczero.1` |
-| LMS (RFC 8554) | hash-based, post-quantum | sha256 (whole construction) | `hbs-lms 0.2.0-alpha.1` (no RISC0 fork; rides the patched `sha2`) |
+| LMS (RFC 8554), W=8 | hash-based, post-quantum | sha256 (whole construction) | `hbs-lms 0.2.0-alpha.1` (no RISC0 fork; rides the patched `sha2`) |
+| LMS (RFC 8554), W=1 | hash-based, post-quantum | sha256 (whole construction) | same crate and guest as W=8 |
+| XMSS (RFC 8391) | hash-based, post-quantum | sha256 (whole construction) | `xmss 0.1.0-pre.0` (RustCrypto pre-release; no RISC0 fork; rides the patched `sha2`) |
 
 The four EC schemes hit RISC Zero's `bigint2` / curve precompile path —
 verified in the Phase 1 spike. Schnorr secp256k1 routes through the
@@ -37,8 +39,12 @@ same `ProjectivePoint::lincomb` accelerated path that ECDSA secp256k1
 uses (no separate code path); Ed25519 uses curve25519-dalek's
 `backend/serial/risc0` module. **LMS** has no RISC0 fork; its only
 acceleration is the SHA-256 precompile reached transitively through
-the patched `sha2` crate. Parameters used: `Sha256_256` / `LmotsW8` /
-`LmsH5` (single-tree HSS, 32 leaves, smallest-signature tradeoff).
+the patched `sha2` crate. Parameters used: `Sha256_256` / `LmsH5`
+(single-tree HSS, 32 leaves) with `LmotsW8` (`lms`, smallest signature)
+and `LmotsW1` (`lms-w1`, fewest hash-chain steps, largest signature).
+hbs-lms reads the parameter set from the signature, so both rows run
+the same guest ELF. **XMSS** uses `XmssSha2_10_256` (h=10, 1024 leaves,
+WOTS+ w=16); like LMS, its only acceleration is the SHA-256 precompile.
 
 ## Results
 
@@ -275,9 +281,10 @@ Ethereum compatibility.
 cargo build --workspace --release
 ```
 
-`risc0-build` cross-compiles six guest ELFs (one per scheme + the
-noop baseline) for `riscv32im-risc0-zkvm-elf` and embeds them as
-`{ECDSA_SECP256K1,SCHNORR_SECP256K1,ED25519,ECDSA_P256,LMS,NOOP}_ELF`.
+`risc0-build` cross-compiles seven guest ELFs (one per scheme + the
+noop baseline; `lms` and `lms-w1` share one) for
+`riscv32im-risc0-zkvm-elf` and embeds them as
+`{ECDSA_SECP256K1,SCHNORR_SECP256K1,ED25519,ECDSA_P256,LMS,XMSS,NOOP}_ELF`.
 
 ## Run the bench
 
@@ -352,7 +359,8 @@ every push and PR. Bench runs are local only.
 │           ├── schnorr_secp256k1.rs
 │           ├── ed25519.rs
 │           ├── ecdsa_p256.rs
-│           ├── lms.rs                    # hash-based / post-quantum row
+│           ├── lms.rs                    # hash-based / post-quantum rows (W=8 and W=1)
+│           ├── xmss.rs                   # hash-based / post-quantum row
 │           └── noop.rs                   # NSSA-wrap-only calibration
 ├── src/
 │   ├── lib.rs                            # Scheme enum + host-side fixtures + verify_all

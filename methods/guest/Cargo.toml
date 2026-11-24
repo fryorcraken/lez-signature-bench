@@ -12,6 +12,7 @@ k256 = { workspace = true, features = ["arithmetic"] }
 p256 = { workspace = true, features = ["arithmetic"] }
 ed25519-dalek.workspace = true
 hbs-lms.workspace = true
+xmss.workspace = true
 sha2.workspace = true
 tiny-keccak.workspace = true
 
@@ -43,4 +44,9 @@ test = false
 [[bin]]
 name = "noop"
 path = "src/bin/noop.rs"
+test = false
+
+[[bin]]
+name = "xmss"
+path = "src/bin/xmss.rs"
 test = false
