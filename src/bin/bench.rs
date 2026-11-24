@@ -64,6 +64,11 @@ struct Cli {
     /// execution time instead of prove time.
     #[arg(long, conflicts_with = "account_id")]
     public: bool,
+    /// Fixture fed to the noop guest with `--scheme noop`. The noop guest
+    /// skips verification, so this isolates the NSSA wrapper's cost of
+    /// reading and echoing that scheme's keys and signatures.
+    #[arg(long, default_value = "ecdsa-secp256k1")]
+    noop_fixture: String,
 }
 
 /// `nssa::program::MAX_NUM_CYCLES_PUBLIC_EXECUTION` at v0.2.0-rc3: the
@@ -402,11 +407,13 @@ async fn main() {
         let n = cli.n.expect("--n required without --all");
 
         let (label, elf, input) = if scheme_str == "noop" {
-            (
-                "noop".to_string(),
-                NOOP_ELF,
-                make_test_vector(Scheme::EcdsaSecp256k1, n),
-            )
+            let fixture = Scheme::parse(&cli.noop_fixture).expect("noop fixture");
+            let label = if fixture == Scheme::EcdsaSecp256k1 {
+                "noop".to_string()
+            } else {
+                format!("noop[{}]", fixture.slug())
+            };
+            (label, NOOP_ELF, make_test_vector(fixture, n))
         } else {
             let scheme = Scheme::parse(scheme_str).expect("scheme");
             (
