@@ -253,6 +253,14 @@ For batch / async workloads, **P-256 or secp256k1 Schnorr at N=3** is
 the budget pick. If keys / addresses must stay secp256k1 (Ethereum
 compat, DIA), Schnorr is the natural step up from ECDSA.
 
+For **public** transactions there is no proof, so the budget is
+execution gas instead of time (see
+[Public execution](#public-execution-no-proof)). Every curve scheme
+verifies 3 signers in under 10% of the 10M per-transaction cap. If the
+verifier has to be post-quantum, LMS W=1 costs about the same gas as
+ECDSA and is the only hash-based row that leaves room in the block at
+N=3. LMS W=8 takes 81% of the cap and XMSS goes over it.
+
 ### End-to-end private-TX time (against a local LEZ `dev` sequencer)
 
 The numbers above isolate the inner proving cost. The number a user
@@ -362,78 +370,128 @@ cheaper privacy circuit, is the lever now, not the signature scheme.
 
 ### Public execution (no proof)
 
-A public LEZ transaction is not proven. At v0.2.0-rc3 the sequencer
-runs the program in the RISC Zero executor (`nssa::Program::execute` →
-`default_executor().execute`, through `r0vm` as the sequencer image
-ships it), with a hard cap of 32M user cycles per execution
-(`MAX_NUM_CYCLES_PUBLIC_EXECUTION`; rc3 has no fees). `bench --public`
-makes the same call with the same cap and the same NSSA input framing.
-Cycles are deterministic; exec time is the median of 5 runs. Run on
-2026-11-24 on the same laptop with risc0-zkvm 3.0.5 and r0vm 3.0.5. The
-host was busy (load average ~7 of 16 threads, from outside the bench),
-so read exec times as indicative.
+A public LEZ transaction is not proven. On `dev` the sequencer runs the
+program in the RISC Zero executor (`lee`'s `Program::handle_message` →
+`execute_session`), with the session limit set to the gas limit the
+transaction declares. Execution gas is user cycles. Static fee validity
+rejects a gas limit above `MAX_GAS_EXEC` = 10M, which is also the cap on
+a whole block's execution gas (the fee market targets 5M per block). A
+run that hits its limit reverts as out of gas, and the fee is still
+charged. Storage gas is charged separately on the transaction's borsh
+size.
 
-| scheme | N | user cycles | noop guest, same fixture | segments | exec time | range (5 runs) | share of 32M cap |
+`bench --public` makes the same executor call, with the same framed
+`ReceiveInput` and a 10M session limit. A row that hits the limit is
+re-run without one, so the table still shows what the verification
+needs, and is marked **over cap**. Cycles are deterministic; exec time
+is the median of 5 runs. Run on 2026-11-24 on the same laptop with
+risc0-zkvm 3.1.0 through `r0vm` 3.1.0. The sequencer image instead
+links the executor in-process with a cached memory image (its `prove`
+feature), so it skips the `r0vm` start-up that dominates the `noop`
+row; the cycles are the same. The host was busy (load average 11–14 of
+16 threads, from outside the bench), so read exec times as indicative.
+
+| scheme | N | user cycles (= exec gas) | noop guest, same fixture | segments | exec time | range (5 runs) | share of 10M gas cap |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `noop` | 1 | 38 636 | — | 1 | 23 ms | 23–30 ms | 0.1% |
-| `ecdsa-secp256k1` | 1 | 342 537 | 38 636 | 1 | 37 ms | 36–38 ms | 1.0% |
-| `ecdsa-secp256k1` | 3 | 989 668 | 93 163 | 2 | 57 ms | 53–57 ms | 2.9% |
-| `schnorr-secp256k1` | 1 | 310 053 | 38 372 | 1 | 33 ms | 33–34 ms | 0.9% |
-| `schnorr-secp256k1` | 3 | 906 312 | 92 384 | 1 | 49 ms | 48–50 ms | 2.7% |
-| `ed25519` | 1 | 841 370 | 38 372 | 1 | 46 ms | 44–48 ms | 2.5% |
-| `ed25519` | 3 | 2 500 221 | 92 384 | 3 | 74 ms | 72–78 ms | 7.5% |
-| `ecdsa-p256` | 1 | 236 769 | 38 636 | 1 | 33 ms | 33–34 ms | 0.7% |
-| `ecdsa-p256` | 3 | 677 017 | 93 163 | 1 | 47 ms | 46–49 ms | 2.0% |
-| `lms` | 1 | 3 029 047 | 383 567 | 4 | 71 ms | 69–72 ms | 9.0% |
-| `lms` | 3 | 9 227 435 | 1 127 815 | 10 | 163 ms | 162–165 ms | 27.5% |
-| `lms-w1` | 1 | 2 686 482 | 2 408 513 | 3 | 75 ms | 74–75 ms | 8.0% |
-| `lms-w1` | 3 | 8 042 960 | 7 202 653 | 9 | 196 ms | 187–198 ms | 24.0% |
-| `xmss` | 1 | 4 650 652 | 715 453 | 5 | 113 ms | 111–118 ms | 13.9% |
-| `xmss` | 3 | 14 023 941 | 2 123 978 | 15 | 256 ms | 247–267 ms | 41.8% |
+| `noop` | 1 | 7 201 | — | 1 | 22 ms | 21–25 ms | 0.1% |
+| `ecdsa-secp256k1` | 1 | 311 082 | 7 201 | 1 | 38 ms | 37–39 ms | 3.1% |
+| `ecdsa-secp256k1` | 3 | 905 444 | 8 959 | 1 | 53 ms | 52–55 ms | 9.1% |
+| `schnorr-secp256k1` | 1 | 278 821 | 7 160 | 1 | 33 ms | 32–35 ms | 2.8% |
+| `schnorr-secp256k1` | 3 | 822 978 | 9 070 | 1 | 48 ms | 47–53 ms | 8.2% |
+| `ed25519` | 1 | 825 288 | 7 160 | 1 | 47 ms | 44–49 ms | 8.3% |
+| `ed25519` | 3 | 2 462 279 | 9 070 | 3 | 74 ms | 72–80 ms | 24.6% |
+| `ecdsa-p256` | 1 | 205 310 | 7 201 | 1 | 32 ms | 32–34 ms | 2.1% |
+| `ecdsa-p256` | 3 | 592 783 | 8 959 | 1 | 46 ms | 45–47 ms | 5.9% |
+| `lms` | 1 | 2 659 761 | 14 301 | 3 | 60 ms | 57–62 ms | 26.6% |
+| `lms` | 3 | 8 130 131 | 30 531 | 9 | 154 ms | 147–158 ms | 81.3% |
+| `lms-w1` | 1 | 334 205 | 56 256 | 1 | 31 ms | 30–32 ms | 3.3% |
+| `lms-w1` | 3 | 996 806 | 156 519 | 2 | 47 ms | 45–48 ms | 10.0% |
+| `xmss` | 1 | 3 962 149 | 21 179 | 5 | 102 ms | 101–106 ms | 39.6% |
+| `xmss` | 3 | 11 968 638 | 51 169 | 13 | 216 ms | 211–228 ms | 119.7% **over cap** |
 
-The "noop guest, same fixture" column runs the verify-free `noop` guest
-on that row's keys and signatures
+The cycle counts match the prove-mode table above row for row, so
+execute and prove count alike. The "noop guest, same fixture" column
+runs the verify-free `noop` guest on that row's keys and signatures
 (`bench --scheme noop --noop-fixture <scheme> --n <N> --public`), so it
-is the NSSA wrapper's cost for that input. The rest is verification.
+is the entrypoint's cost for that input. The rest is verification.
 
-| scheme | signature | verify / sig (N=1) | verify / sig (N=3 − N=1, ÷2) | input handling / sig | ≈ max N under the cap |
+| scheme | signature | verify / sig (N=1) | verify / sig (N=3 − N=1, ÷2) | input handling / sig | ≈ max N under 10M |
 |---|---:|---:|---:|---:|---:|
-| `ecdsa-p256` | 64 B | 198 133 | 192 860 | 27 264 | 152 |
-| `schnorr-secp256k1` | 64 B | 271 681 | 271 124 | 27 006 | 112 |
-| `ecdsa-secp256k1` | 64 B | 303 901 | 296 302 | 27 264 | 103 |
-| `ed25519` | 64 B | 802 998 | 802 420 | 27 006 | 40 |
-| `lms-w1` | 8 688 B | 277 969 | 281 169 | 2 397 070 | 12 |
-| `lms` | 1 296 B | 2 645 480 | 2 727 070 | 372 124 | 10 |
-| `xmss` | 2 500 B | 3 935 199 | 3 982 382 | 704 262 | 7 |
+| `ecdsa-p256` | 64 B | 198 109 | 192 858 | 879 | 51 |
+| `schnorr-secp256k1` | 64 B | 271 661 | 271 124 | 955 | 36 |
+| `ecdsa-secp256k1` | 64 B | 303 881 | 296 302 | 879 | 33 |
+| `lms-w1` | 8 688 B | 277 949 | 281 169 | 50 132 | 30 |
+| `ed25519` | 64 B | 818 128 | 817 540 | 955 | 12 |
+| `lms` | 1 296 B | 2 645 460 | 2 727 070 | 8 115 | 3 |
+| `xmss` | 2 500 B | 3 940 970 | 3 988 250 | 14 995 | 2 |
 
 "Max N" extrapolates linearly from N=1 and N=3; the fixtures only go
 to N=3.
 
-- **Public execution is cheap at every N measured: 23–260 ms per
-  call**, against minutes for a private TX. The `noop` floor (~23 ms)
-  is mostly `r0vm` start-up and the IPC round trip. The heaviest row,
-  `xmss` N=3, uses 42% of the cap.
-- **The NSSA wrapper costs ~274 user cycles per input byte.** rc3
-  encodes the instruction with RISC Zero serde (one u32 word per byte);
-  the guest decodes it and echoes the raw instruction data into
-  `ProgramOutput`. For 64-byte curve signatures that is noise (~27K
-  cycles per signer); for hash-based signatures it is not.
-- **LMS W=1 verifies as cheaply as ECDSA, but its signature costs
-  more than the verify saves.** W=1 has 265 hash chains of one step
-  where W=8 has 34 chains of up to 255 steps, so verification alone
-  drops ~10× to ~280K cycles per signature, about what ECDSA secp256k1
-  costs. Its 8 688-byte signature adds ~2.4M cycles
-  of input handling, so `lms-w1` lands within 11% of `lms` (W=8,
-  1 296 B). On this wrapper, the smaller hash-based signature wins.
-- **XMSS (h=10) costs ~1.5× LMS (h=5, W=8) per signature**: ~3.96M
-  cycles of verification plus ~0.70M of input handling for a 2 500-byte
-  signature. In exchange, each key signs 1 024 messages instead of 32.
-- **LMS cycles differ from the prove-mode table above**: 3 029 047 at
-  N=1 here vs 2 720 550 there (+11%). A dev-mode prove of this build
-  reports the same 3 029 047, so execute and prove count alike, and
-  the LMS fixture is byte-identical (a test pins it). The gap is
-  between this guest build and the one behind that table; the curve
-  rows reproduce within 0.3%.
+- **The 10M gas cap is now the binding limit, and it applies per
+  block.** `xmss` N=3 needs 12.0M cycles and would revert out of gas.
+  `lms` N=3 uses 81% of the cap. One transaction near the cap fills a
+  whole block, at twice the fee market's 5M target. Multi-signer
+  hash-based verification at W=8 or XMSS therefore crowds out
+  everything else in that block. ECDSA and Schnorr stay under 10% of
+  the cap at N=3.
+- **Input handling is close to free: ~6 user cycles per input byte.**
+  The actor entrypoint borsh-decodes the message and does not echo it,
+  where rc3's NSSA wrapper cost ~274 cycles per byte (see below).
+  A 64-byte curve signer costs under 1K cycles to read; an 8.7 KB LMS
+  W=1 signer costs ~50K.
+- **LMS W=1 is now the cheapest post-quantum row by far**: 334K cycles
+  at N=1, within 8% of ECDSA secp256k1 (311K), 8× below LMS W=8 and
+  12× below XMSS, and about 30 signers fit under the cap. W=1 has 265
+  hash chains of one step where W=8 has 34 chains of up to 255 steps.
+  The cost moves into bytes: the 8 688-byte signature is 6.7× W=8's,
+  and every byte is charged as storage gas. Each key signs 32 messages
+  at H=5, the same as W=8.
+- **XMSS (h=10) costs ~1.5× LMS W=8 per signature** (~3.94M cycles).
+  In exchange each key signs 1 024 messages instead of 32.
+- **Public execution takes 22–216 ms per call** at every N measured,
+  against minutes for a private TX.
+
+#### Public execution: LEZ v0.2.0-rc3 → `dev`
+
+The rc3 side is the same bench on `main` (risc0-zkvm and `r0vm` 3.0.5,
+under rc3's flat 32M-cycle `MAX_NUM_CYCLES_PUBLIC_EXECUTION`, no fees),
+run the same day on the same fixtures:
+
+| scheme | N | user cycles (rc3 → dev) | Δ | noop guest, same fixture (rc3 → dev) | ≈ max N (rc3 at 32M → dev at 10M) |
+|---|---:|---:|---:|---:|---:|
+| `noop` | 1 | 38 636 → 7 201 | -81% | — | — |
+| `ecdsa-secp256k1` | 1 | 342 537 → 311 082 | -9% | 38 636 → 7 201 | 103 → 33 |
+| `ecdsa-secp256k1` | 3 | 989 668 → 905 444 | -9% | 93 163 → 8 959 | |
+| `schnorr-secp256k1` | 1 | 310 053 → 278 821 | -10% | 38 372 → 7 160 | 112 → 36 |
+| `schnorr-secp256k1` | 3 | 906 312 → 822 978 | -9% | 92 384 → 9 070 | |
+| `ed25519` | 1 | 841 370 → 825 288 | -2% | 38 372 → 7 160 | 40 → 12 |
+| `ed25519` | 3 | 2 500 221 → 2 462 279 | -2% | 92 384 → 9 070 | |
+| `ecdsa-p256` | 1 | 236 769 → 205 310 | -13% | 38 636 → 7 201 | 152 → 51 |
+| `ecdsa-p256` | 3 | 677 017 → 592 783 | -12% | 93 163 → 8 959 | |
+| `lms` | 1 | 3 029 047 → 2 659 761 | -12% | 383 567 → 14 301 | 10 → 3 |
+| `lms` | 3 | 9 227 435 → 8 130 131 | -12% | 1 127 815 → 30 531 | |
+| `lms-w1` | 1 | 2 686 482 → 334 205 | **-88%** | 2 408 513 → 56 256 | **12 → 30** |
+| `lms-w1` | 3 | 8 042 960 → 996 806 | **-88%** | 7 202 653 → 156 519 | |
+| `xmss` | 1 | 4 650 652 → 3 962 149 | -15% | 715 453 → 21 179 | 7 → 2 |
+| `xmss` | 3 | 14 023 941 → 11 968 638 | -15% | 2 123 978 → 51 169 | |
+
+- **The whole change is input handling.** Verification per signature
+  is the same on both sides within 0.2% (`ed25519` +1.9%, from
+  `ed25519-dalek` 2.1.1 → 2.2.0). What fell is the entrypoint's cost
+  of reading the input. rc3 encoded the instruction with RISC Zero
+  serde (one u32 word per byte) and echoed it back into
+  `ProgramOutput`; `dev` reads one borsh frame.
+- **LMS W=1 flips from "no better than W=8" to the best hash-based
+  option.** On rc3 its 8.7 KB signature cost ~2.4M cycles to read, which
+  erased the 10× cheaper verify. On `dev` that is ~50K.
+- **Every other scheme fits fewer signers per transaction** because the
+  cap fell 3.4× (32M → 10M), and that cap is now shared by a whole
+  block.
+- The rc3 LMS row (3 029 047) is from the guest build behind the rc3
+  public results, not the 2 720 550 of the rc3 prove-mode comparison
+  above. Verify per signature is 2 645 480 on rc3 and 2 645 460 on
+  `dev`, so the difference is in that build's input handling.
 
 ## Methodology
 
