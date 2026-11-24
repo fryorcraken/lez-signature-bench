@@ -66,6 +66,7 @@ decision note are the primary artifacts.
 | `cargo run --release --bin gen_test_vectors -- --scheme <s> --n <n>` | Produce a deterministic synthetic fixture for one (scheme, N) point. |
 | `cargo run --release --bin bench -- --scheme <s> --n <n> --account-id <id>` | Run a single bench point as a real private TX; print cycles, prove_time, receipt_size, tx_e2e. |
 | `cargo run --release --bin bench -- --all --account-id <id>` | Run the full matrix; write `results/results.json` and a Markdown table snippet. |
+| `cargo run --release --bin bench -- --all --public` | Run the full matrix as public execution (executor only, no proof, 32M-cycle cap); print cycles and execution time. |
 | `cargo test --workspace` | Host-side fixture round-trip + executor-mode guest sanity per scheme. |
 | `cargo fmt --all --check` | Format check (CI). |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Lint (CI). |

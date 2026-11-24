@@ -289,6 +289,12 @@ RISC0_DEV_MODE=0 cargo run --release --bin bench -- \
 # Full matrix → results/results.json + results/README-snippet.md
 RISC0_DEV_MODE=0 cargo run --release --bin bench -- --all
 
+# Public-execution matrix: execute without proving, as the sequencer
+# does for a public TX (needs an r0vm matching risc0-zkvm 3.0, e.g.
+# RISC0_SERVER_PATH=/path/to/r0vm-3.0.5)
+cargo run --release --bin bench -- --all --public --label public
+# → results/results-public.json + results/README-snippet-public.md
+
 # End-to-end matrix against a running lgs localnet
 lgs localnet start
 lgs wallet -- account new private    # note the printed Private/<id>
