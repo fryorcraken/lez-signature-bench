@@ -1,9 +1,14 @@
 //! Bench harness for signature schemes inside an NSSA-wrapped LEZ guest.
 //!
-//! Two modes:
+//! Three modes:
 //!
 //! * **Local prove** (default): proves locally via
 //!   `risc0_zkvm::default_prover()`. Records cycles, prove time, receipt size.
+//! * **Public execution** (`--public`): runs the guest in
+//!   `risc0_zkvm::default_executor()` without proving, which is what the
+//!   sequencer does for a public transaction (`nssa::Program::execute` at
+//!   v0.2.0-rc3), under the same 32M user-cycle cap. Records cycles and
+//!   execution time.
 //! * **End-to-end private TX** (`--account-id <id>`): submits a real
 //!   privacy-preserving transaction via `wallet::WalletCore::send_privacy_preserving_tx`
 //!   against a running localnet. Records wall-clock end-to-end time.
@@ -24,7 +29,7 @@ use lez_signature_bench_methods::{
     XMSS_ELF,
 };
 use nssa::{AccountId, program::Program};
-use risc0_zkvm::{ExecutorEnv, default_prover};
+use risc0_zkvm::{ExecutorEnv, default_executor, default_prover};
 use serde::{Deserialize, Serialize};
 use wallet::{PrivacyPreservingAccount, WalletCore};
 
@@ -54,6 +59,23 @@ struct Cli {
     /// File suffix for output files in --all mode (e.g. "e2e" → results-e2e.json).
     #[arg(long)]
     label: Option<String>,
+    /// Public execution: execute the guest without proving, as the
+    /// sequencer does for a public transaction. Records cycles and
+    /// execution time instead of prove time.
+    #[arg(long, conflicts_with = "account_id")]
+    public: bool,
+}
+
+/// `nssa::program::MAX_NUM_CYCLES_PUBLIC_EXECUTION` at v0.2.0-rc3: the
+/// sequencer's session limit for one public program execution. The
+/// executor counts it in user cycles.
+const MAX_NUM_CYCLES_PUBLIC_EXECUTION: u64 = 1024 * 1024 * 32;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum Mode {
+    Prove,
+    Public,
+    E2e,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -67,6 +89,9 @@ struct Row {
     segments: Option<usize>,
     prove_seconds: Option<f64>,
     receipt_bytes: Option<usize>,
+    /// Execute-only wall-clock (Some only in public mode).
+    #[serde(default)]
+    exec_seconds: Option<f64>,
     /// E2E private-TX wall-clock (Some only in E2E mode).
     tx_e2e_seconds: Option<f64>,
 }
@@ -84,7 +109,7 @@ fn elf_for(scheme: Scheme) -> &'static [u8] {
     }
 }
 
-fn build_local_env<'a>(input: &'a VerifyInput) -> ExecutorEnv<'a> {
+fn build_local_env<'a>(input: &'a VerifyInput, session_limit: Option<u64>) -> ExecutorEnv<'a> {
     let self_program_id: [u32; 8] = [0; 8];
     let caller_program_id: Option<[u32; 8]> = None;
     let pre_states: Vec<nssa_core::account::AccountWithMetadata> = Vec::new();
@@ -99,12 +124,13 @@ fn build_local_env<'a>(input: &'a VerifyInput) -> ExecutorEnv<'a> {
         .unwrap()
         .write(&instruction_data)
         .unwrap()
+        .session_limit(session_limit)
         .build()
         .unwrap()
 }
 
 fn run_local(label: &str, n: usize, elf: &'static [u8], input: &VerifyInput) -> Row {
-    let env = build_local_env(input);
+    let env = build_local_env(input, None);
     let t0 = Instant::now();
     let prove_info = default_prover().prove(env, elf).expect("prove");
     let prove_seconds = t0.elapsed().as_secs_f64();
@@ -121,6 +147,28 @@ fn run_local(label: &str, n: usize, elf: &'static [u8], input: &VerifyInput) -> 
         segments: Some(stats.segments),
         prove_seconds: Some(prove_seconds),
         receipt_bytes: Some(receipt_bytes),
+        exec_seconds: None,
+        tx_e2e_seconds: None,
+    }
+}
+
+fn run_public(label: &str, n: usize, elf: &'static [u8], input: &VerifyInput) -> Row {
+    let env = build_local_env(input, Some(MAX_NUM_CYCLES_PUBLIC_EXECUTION));
+    let t0 = Instant::now();
+    let session = default_executor().execute(env, elf).expect("execute");
+    let exec_seconds = t0.elapsed().as_secs_f64();
+    Row {
+        scheme: label.to_string(),
+        n,
+        // What a prover would pay: each segment padded to its po2.
+        total_cycles: Some(session.segments.iter().map(|s| 1u64 << s.po2).sum()),
+        user_cycles: Some(session.cycles()),
+        // The executor's SessionInfo does not report paging cycles.
+        paging_cycles: None,
+        segments: Some(session.segments.len()),
+        prove_seconds: None,
+        receipt_bytes: None,
+        exec_seconds: Some(exec_seconds),
         tx_e2e_seconds: None,
     }
 }
@@ -153,12 +201,42 @@ async fn run_e2e(
         segments: None,
         prove_seconds: None,
         receipt_bytes: None,
+        exec_seconds: None,
         tx_e2e_seconds: Some(elapsed),
     }
 }
 
+async fn run_row(
+    mode: Mode,
+    label: &str,
+    n: usize,
+    elf: &'static [u8],
+    input: &VerifyInput,
+    e2e: Option<(AccountId, &WalletCore)>,
+) -> Row {
+    if let Some((aid, wallet)) = e2e {
+        return run_e2e(label, n, elf, input, aid, wallet).await;
+    }
+    match mode {
+        Mode::Public => run_public(label, n, elf, input),
+        _ => run_local(label, n, elf, input),
+    }
+}
+
 fn print_row(r: &Row) {
-    if let Some(s) = r.tx_e2e_seconds {
+    if let Some(s) = r.exec_seconds {
+        let user = r.user_cycles.unwrap();
+        println!(
+            "{:<22} n={} cycles(user/padded)={}/{} segs={} exec={:.4}s cap={:.1}%",
+            r.scheme,
+            r.n,
+            user,
+            r.total_cycles.unwrap(),
+            r.segments.unwrap(),
+            s,
+            100.0 * user as f64 / MAX_NUM_CYCLES_PUBLIC_EXECUTION as f64,
+        );
+    } else if let Some(s) = r.tx_e2e_seconds {
         println!(
             "{:<22} n={} tx_e2e={:.2}s (~{}:{:02})",
             r.scheme,
@@ -182,7 +260,7 @@ fn print_row(r: &Row) {
     }
 }
 
-fn write_outputs(rows: &[Row], out_dir: &PathBuf, label: Option<&str>, e2e: bool) {
+fn write_outputs(rows: &[Row], out_dir: &PathBuf, label: Option<&str>, mode: Mode) {
     std::fs::create_dir_all(out_dir).expect("create out_dir");
     let suffix = label.map(|s| format!("-{}", s)).unwrap_or_default();
 
@@ -190,7 +268,25 @@ fn write_outputs(rows: &[Row], out_dir: &PathBuf, label: Option<&str>, e2e: bool
     std::fs::write(out_dir.join(format!("results{}.json", suffix)), json).expect("write json");
 
     let mut md = String::new();
-    if e2e {
+    if mode == Mode::Public {
+        md.push_str(
+            "| scheme | N | user cycles | padded cycles | segments | exec time | share of 32M cap |\n",
+        );
+        md.push_str("|---|---:|---:|---:|---:|---:|---:|\n");
+        for r in rows {
+            let user = r.user_cycles.unwrap_or(0);
+            md.push_str(&format!(
+                "| `{}` | {} | {} | {} | {} | {:.1} ms | {:.1}% |\n",
+                r.scheme,
+                r.n,
+                user,
+                r.total_cycles.unwrap_or(0),
+                r.segments.unwrap_or(0),
+                1000.0 * r.exec_seconds.unwrap_or(0.0),
+                100.0 * user as f64 / MAX_NUM_CYCLES_PUBLIC_EXECUTION as f64,
+            ));
+        }
+    } else if mode == Mode::E2e {
         md.push_str("| scheme | N | end-to-end TX time |\n");
         md.push_str("|---|---:|---:|\n");
         for r in rows {
@@ -249,8 +345,14 @@ async fn main() {
         eprintln!("warning: RISC0_DEV_MODE=1 — numbers below are NOT real measurements.");
     }
 
-    let e2e = cli.account_id.is_some();
-    let wallet_core = if e2e {
+    let mode = if cli.account_id.is_some() {
+        Mode::E2e
+    } else if cli.public {
+        Mode::Public
+    } else {
+        Mode::Prove
+    };
+    let wallet_core = if mode == Mode::E2e {
         Some(WalletCore::from_env().expect("WalletCore from env (set NSSA_WALLET_HOME_DIR)"))
     } else {
         None
@@ -261,11 +363,15 @@ async fn main() {
         let mut rows: Vec<Row> = Vec::new();
 
         let baseline_input = make_test_vector(Scheme::EcdsaSecp256k1, 1);
-        let row = if let (Some(wallet), Some(aid)) = (wallet_core.as_ref(), account_id) {
-            run_e2e("noop", 1, NOOP_ELF, &baseline_input, aid, wallet).await
-        } else {
-            run_local("noop", 1, NOOP_ELF, &baseline_input)
-        };
+        let row = run_row(
+            mode,
+            "noop",
+            1,
+            NOOP_ELF,
+            &baseline_input,
+            account_id.zip(wallet_core.as_ref()),
+        )
+        .await;
         print_row(&row);
         rows.push(row);
 
@@ -273,17 +379,21 @@ async fn main() {
             let elf = elf_for(scheme);
             for &n in &cli.ns {
                 let input = make_test_vector(scheme, n);
-                let row = if let (Some(wallet), Some(aid)) = (wallet_core.as_ref(), account_id) {
-                    run_e2e(scheme.slug(), n, elf, &input, aid, wallet).await
-                } else {
-                    run_local(scheme.slug(), n, elf, &input)
-                };
+                let row = run_row(
+                    mode,
+                    scheme.slug(),
+                    n,
+                    elf,
+                    &input,
+                    account_id.zip(wallet_core.as_ref()),
+                )
+                .await;
                 print_row(&row);
                 rows.push(row);
             }
         }
 
-        write_outputs(&rows, &cli.out_dir, cli.label.as_deref(), e2e);
+        write_outputs(&rows, &cli.out_dir, cli.label.as_deref(), mode);
     } else {
         let scheme_str = cli
             .scheme
@@ -306,11 +416,15 @@ async fn main() {
             )
         };
 
-        let row = if let (Some(wallet), Some(aid)) = (wallet_core.as_ref(), account_id) {
-            run_e2e(&label, n, elf, &input, aid, wallet).await
-        } else {
-            run_local(&label, n, elf, &input)
-        };
+        let row = run_row(
+            mode,
+            &label,
+            n,
+            elf,
+            &input,
+            account_id.zip(wallet_core.as_ref()),
+        )
+        .await;
         print_row(&row);
     }
 }
