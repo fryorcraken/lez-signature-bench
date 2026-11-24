@@ -5,7 +5,6 @@ edition = "2024"
 license = { workspace = true }
 
 [dependencies]
-xmss = { workspace = true }
 risc0-zkvm.workspace = true
 nssa_core.workspace = true
 serde.workspace = true
@@ -13,6 +12,7 @@ k256 = { workspace = true, features = ["arithmetic"] }
 p256 = { workspace = true, features = ["arithmetic"] }
 ed25519-dalek.workspace = true
 hbs-lms.workspace = true
+xmss.workspace = true
 sha2.workspace = true
 tiny-keccak.workspace = true
 
@@ -49,9 +49,4 @@ test = false
 [[bin]]
 name = "xmss"
 path = "src/bin/xmss.rs"
-test = false
-
-[[bin]]
-name = "lms_w1"
-path = "src/bin/lms_w1.rs"
 test = false

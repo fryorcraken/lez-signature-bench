@@ -7,7 +7,7 @@ fn expand_seed(seed: &[u8; 32]) -> [u8; 96] {
     out[..32].copy_from_slice(seed);
     let h1: [u8; 32] = Sha256::digest(seed).into();
     out[32..64].copy_from_slice(&h1);
-    let h2: [u8; 32] = Sha256::digest(&h1).into();
+    let h2: [u8; 32] = Sha256::digest(h1).into();
     out[64..96].copy_from_slice(&h2);
     out
 }
