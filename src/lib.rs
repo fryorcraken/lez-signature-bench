@@ -22,6 +22,8 @@ pub enum Scheme {
     Ed25519,
     EcdsaP256,
     Lms,
+    LmsW1,
+    Xmss,
 }
 
 impl Scheme {
@@ -31,6 +33,8 @@ impl Scheme {
         Scheme::Ed25519,
         Scheme::EcdsaP256,
         Scheme::Lms,
+        Scheme::LmsW1,
+        Scheme::Xmss,
     ];
 
     pub fn slug(self) -> &'static str {
@@ -40,6 +44,8 @@ impl Scheme {
             Scheme::Ed25519 => "ed25519",
             Scheme::EcdsaP256 => "ecdsa-p256",
             Scheme::Lms => "lms",
+            Scheme::LmsW1 => "lms-w1",
+            Scheme::Xmss => "xmss",
         }
     }
 
@@ -116,6 +122,8 @@ pub fn make_test_vector(scheme: Scheme, num_signers: usize) -> VerifyInput {
             Scheme::Ed25519 => verifier::ed25519::sign(seed, MESSAGE),
             Scheme::EcdsaP256 => verifier::ecdsa_p256::sign(seed, MESSAGE),
             Scheme::Lms => verifier::lms::sign(seed, MESSAGE),
+            Scheme::LmsW1 => verifier::lms::sign_w1(seed, MESSAGE),
+            Scheme::Xmss => verifier::xmss::sign(seed, MESSAGE),
         })
         .collect();
 
@@ -154,6 +162,8 @@ pub fn verify(scheme: Scheme, input: &VerifyInput) -> Result<(), String> {
         Scheme::Ed25519 => verifier::ed25519::verify_all(input),
         Scheme::EcdsaP256 => verifier::ecdsa_p256::verify_all(input),
         Scheme::Lms => verifier::lms::verify_all(input),
+        Scheme::LmsW1 => verifier::lms::verify_all(input),
+        Scheme::Xmss => verifier::xmss::verify_all(input),
     }
 }
 
@@ -257,17 +267,55 @@ mod tests {
     }
 
     #[test]
-    fn negative_lms() {
-        // hbs-lms parses the signature header (HSS levels + LM-OTS/LMS type
-        // codes) before checking content; flipping byte 0 panics inside the
-        // library on a malformed type code. Flip a byte deep in the C value
-        // so we exercise verification, not parsing.
-        let mut v = make_test_vector(Scheme::Lms, 1);
+    fn round_trip_lms_w1() {
+        round_trip(Scheme::LmsW1, 1);
+        round_trip(Scheme::LmsW1, 3);
+    }
+
+    #[test]
+    fn round_trip_xmss() {
+        round_trip(Scheme::Xmss, 1);
+        round_trip(Scheme::Xmss, 3);
+    }
+
+    /// Flip the last signature byte rather than byte 0: hbs-lms parses the
+    /// signature header (HSS levels + LM-OTS/LMS type codes) before checking
+    /// content and panics on a malformed type code, and byte 0 of an XMSS
+    /// signature is the leaf index. The last byte is authentication-path
+    /// data, so this exercises verification, not parsing.
+    fn flip_last_byte_fails(scheme: Scheme) {
+        let mut v = make_test_vector(scheme, 1);
         let last = v.signers[0].signature.len() - 1;
         v.signers[0].signature[last] ^= 0xff;
         assert!(
-            verify(Scheme::Lms, &v).is_err(),
-            "Lms: one-byte sig flip should fail",
+            verify(scheme, &v).is_err(),
+            "{scheme:?}: one-byte sig flip should fail",
         );
+    }
+
+    #[test]
+    fn negative_lms() {
+        flip_last_byte_fails(Scheme::Lms);
+    }
+
+    #[test]
+    fn negative_lms_w1() {
+        flip_last_byte_fails(Scheme::LmsW1);
+    }
+
+    #[test]
+    fn negative_xmss() {
+        flip_last_byte_fails(Scheme::Xmss);
+    }
+
+    /// W=1 must really produce W=1 signatures: a W=8 fixture would silently
+    /// make the `lms-w1` row a duplicate of `lms`.
+    #[test]
+    fn lms_w1_signature_is_larger_than_w8() {
+        let w8 = make_test_vector(Scheme::Lms, 1).signers[0].signature.len();
+        let w1 = make_test_vector(Scheme::LmsW1, 1).signers[0]
+            .signature
+            .len();
+        assert!(w1 > 5 * w8, "W=1 sig {w1} B vs W=8 sig {w8} B");
     }
 }

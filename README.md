@@ -12,7 +12,8 @@ inside the [Logos Execution Zone (LEZ)](https://github.com/logos-blockchain/logo
 guest model on the [RISC Zero zkVM](https://risczero.com/). Each scheme
 runs inside a LEZ actor-model guest (`lee_core::actor_entrypoint!`, LEZ
 `dev`) using RISC Zero's accelerated curve arithmetic, and is benchmarked
-through the local prover and end-to-end as a private transaction.
+through the local prover and end-to-end as a private transaction, and
+through the executor as a public transaction.
 
 The goal is *data*, not deployment: cycles, prove time, and receipt
 size for each scheme so a developer choosing a verification primitive
@@ -30,7 +31,9 @@ See [`SPEC.md`](./SPEC.md) for acceptance criteria and
 | Schnorr secp256k1 (BIP-340) | secp256k1 | sha256 | (same fork as ECDSA) |
 | Ed25519 | Curve25519 | none (sha512 internal) | `curve25519-4.1.3-risczero.0` (curve25519-dalek; ed25519-dalek 2.2.0 from crates.io) |
 | ECDSA P-256 | NIST P-256 | sha256 | `p256/v0.13.2-risczero.1` |
-| LMS (RFC 8554) | hash-based, post-quantum | sha256 (whole construction) | `hbs-lms 0.2.0-alpha.1` (no RISC0 fork; rides the patched `sha2`) |
+| LMS (RFC 8554), W=8 | hash-based, post-quantum | sha256 (whole construction) | `hbs-lms 0.2.0-alpha.1` (no RISC0 fork; rides the patched `sha2`) |
+| LMS (RFC 8554), W=1 | hash-based, post-quantum | sha256 (whole construction) | same crate and guest as W=8 |
+| XMSS (RFC 8391) | hash-based, post-quantum | sha256 (whole construction) | `xmss 0.1.0-pre.0` (RustCrypto pre-release; no RISC0 fork; rides the patched `sha2`) |
 
 The four EC schemes hit RISC Zero's `bigint2` / curve precompile path —
 verified in the Phase 1 spike. Schnorr secp256k1 routes through the
@@ -41,8 +44,12 @@ LEZ itself; LEZ `dev` needs `ed25519-dalek ^2.2`, so the risc0 fork's
 2.1.1 copy is no longer used. Per-sig Ed25519 cycles moved +1.8%, so the
 accelerated backend is still in play.) **LMS** has no RISC0 fork; its only
 acceleration is the SHA-256 precompile reached transitively through
-the patched `sha2` crate. Parameters used: `Sha256_256` / `LmotsW8` /
-`LmsH5` (single-tree HSS, 32 leaves, smallest-signature tradeoff).
+the patched `sha2` crate. Parameters used: `Sha256_256` / `LmsH5`
+(single-tree HSS, 32 leaves) with `LmotsW8` (`lms`, smallest signature)
+and `LmotsW1` (`lms-w1`, fewest hash-chain steps, largest signature).
+hbs-lms reads the parameter set from the signature, so both rows run
+the same guest ELF. **XMSS** uses `XmssSha2_10_256` (h=10, 1024 leaves,
+WOTS+ w=16); like LMS, its only acceleration is the SHA-256 precompile.
 
 ## Results
 
@@ -87,6 +94,9 @@ prove time are the keccak coprocessor (see
 [Keccak coprocessor note](#keccak-coprocessor-note)). Cycle counts are
 identical in every run; prove time spreads 2–19% (max − min over
 median) between runs (see [Run-to-run variance](#run-to-run-variance)).
+
+`lms-w1` and `xmss` have not been proven yet; their cycle counts are in
+[Public execution](#public-execution-no-proof).
 
 **Prove time follows the padded segment size, not the cycle count.**
 Every row without keccak lands on the same curve: ~4.3 s for a 2^15
@@ -350,6 +360,81 @@ For interactive UX (sub-30 s) **nothing fits on CPU**, and on `dev`
 even a no-crypto private TX takes ~10 minutes here. CUDA / Bonsai, or a
 cheaper privacy circuit, is the lever now, not the signature scheme.
 
+### Public execution (no proof)
+
+A public LEZ transaction is not proven. At v0.2.0-rc3 the sequencer
+runs the program in the RISC Zero executor (`nssa::Program::execute` →
+`default_executor().execute`, through `r0vm` as the sequencer image
+ships it), with a hard cap of 32M user cycles per execution
+(`MAX_NUM_CYCLES_PUBLIC_EXECUTION`; rc3 has no fees). `bench --public`
+makes the same call with the same cap and the same NSSA input framing.
+Cycles are deterministic; exec time is the median of 5 runs. Run on
+2026-11-24 on the same laptop with risc0-zkvm 3.0.5 and r0vm 3.0.5. The
+host was busy (load average ~7 of 16 threads, from outside the bench),
+so read exec times as indicative.
+
+| scheme | N | user cycles | noop guest, same fixture | segments | exec time | range (5 runs) | share of 32M cap |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `noop` | 1 | 38 636 | — | 1 | 23 ms | 23–30 ms | 0.1% |
+| `ecdsa-secp256k1` | 1 | 342 537 | 38 636 | 1 | 37 ms | 36–38 ms | 1.0% |
+| `ecdsa-secp256k1` | 3 | 989 668 | 93 163 | 2 | 57 ms | 53–57 ms | 2.9% |
+| `schnorr-secp256k1` | 1 | 310 053 | 38 372 | 1 | 33 ms | 33–34 ms | 0.9% |
+| `schnorr-secp256k1` | 3 | 906 312 | 92 384 | 1 | 49 ms | 48–50 ms | 2.7% |
+| `ed25519` | 1 | 841 370 | 38 372 | 1 | 46 ms | 44–48 ms | 2.5% |
+| `ed25519` | 3 | 2 500 221 | 92 384 | 3 | 74 ms | 72–78 ms | 7.5% |
+| `ecdsa-p256` | 1 | 236 769 | 38 636 | 1 | 33 ms | 33–34 ms | 0.7% |
+| `ecdsa-p256` | 3 | 677 017 | 93 163 | 1 | 47 ms | 46–49 ms | 2.0% |
+| `lms` | 1 | 3 029 047 | 383 567 | 4 | 71 ms | 69–72 ms | 9.0% |
+| `lms` | 3 | 9 227 435 | 1 127 815 | 10 | 163 ms | 162–165 ms | 27.5% |
+| `lms-w1` | 1 | 2 686 482 | 2 408 513 | 3 | 75 ms | 74–75 ms | 8.0% |
+| `lms-w1` | 3 | 8 042 960 | 7 202 653 | 9 | 196 ms | 187–198 ms | 24.0% |
+| `xmss` | 1 | 4 650 652 | 715 453 | 5 | 113 ms | 111–118 ms | 13.9% |
+| `xmss` | 3 | 14 023 941 | 2 123 978 | 15 | 256 ms | 247–267 ms | 41.8% |
+
+The "noop guest, same fixture" column runs the verify-free `noop` guest
+on that row's keys and signatures
+(`bench --scheme noop --noop-fixture <scheme> --n <N> --public`), so it
+is the NSSA wrapper's cost for that input. The rest is verification.
+
+| scheme | signature | verify / sig (N=1) | verify / sig (N=3 − N=1, ÷2) | input handling / sig | ≈ max N under the cap |
+|---|---:|---:|---:|---:|---:|
+| `ecdsa-p256` | 64 B | 198 133 | 192 860 | 27 264 | 152 |
+| `schnorr-secp256k1` | 64 B | 271 681 | 271 124 | 27 006 | 112 |
+| `ecdsa-secp256k1` | 64 B | 303 901 | 296 302 | 27 264 | 103 |
+| `ed25519` | 64 B | 802 998 | 802 420 | 27 006 | 40 |
+| `lms-w1` | 8 688 B | 277 969 | 281 169 | 2 397 070 | 12 |
+| `lms` | 1 296 B | 2 645 480 | 2 727 070 | 372 124 | 10 |
+| `xmss` | 2 500 B | 3 935 199 | 3 982 382 | 704 262 | 7 |
+
+"Max N" extrapolates linearly from N=1 and N=3; the fixtures only go
+to N=3.
+
+- **Public execution is cheap at every N measured: 23–260 ms per
+  call**, against minutes for a private TX. The `noop` floor (~23 ms)
+  is mostly `r0vm` start-up and the IPC round trip. The heaviest row,
+  `xmss` N=3, uses 42% of the cap.
+- **The NSSA wrapper costs ~274 user cycles per input byte.** rc3
+  encodes the instruction with RISC Zero serde (one u32 word per byte);
+  the guest decodes it and echoes the raw instruction data into
+  `ProgramOutput`. For 64-byte curve signatures that is noise (~27K
+  cycles per signer); for hash-based signatures it is not.
+- **LMS W=1 verifies as cheaply as ECDSA, but its signature costs
+  more than the verify saves.** W=1 has 265 hash chains of one step
+  where W=8 has 34 chains of up to 255 steps, so verification alone
+  drops ~10× to ~280K cycles per signature, about what ECDSA secp256k1
+  costs. Its 8 688-byte signature adds ~2.4M cycles
+  of input handling, so `lms-w1` lands within 11% of `lms` (W=8,
+  1 296 B). On this wrapper, the smaller hash-based signature wins.
+- **XMSS (h=10) costs ~1.5× LMS (h=5, W=8) per signature**: ~3.96M
+  cycles of verification plus ~0.70M of input handling for a 2 500-byte
+  signature. In exchange, each key signs 1 024 messages instead of 32.
+- **LMS cycles differ from the prove-mode table above**: 3 029 047 at
+  N=1 here vs 2 720 550 there (+11%). A dev-mode prove of this build
+  reports the same 3 029 047, so execute and prove count alike, and
+  the LMS fixture is byte-identical (a test pins it). The gap is
+  between this guest build and the one behind that table; the curve
+  rows reproduce within 0.3%.
+
 ## Methodology
 
 Each local-prove row is a **real prove** through
@@ -518,9 +603,10 @@ circuit itself also calls keccak (192 calls per private TX).
 cargo build --workspace --release
 ```
 
-`risc0-build` cross-compiles six guest ELFs (one per scheme + the
-noop baseline) for `riscv32im-risc0-zkvm-elf` and embeds them as
-`{ECDSA_SECP256K1,SCHNORR_SECP256K1,ED25519,ECDSA_P256,LMS,NOOP}_ELF`.
+`risc0-build` cross-compiles seven guest ELFs (one per scheme + the
+noop baseline; `lms` and `lms-w1` share one) for
+`riscv32im-risc0-zkvm-elf` and embeds them as
+`{ECDSA_SECP256K1,SCHNORR_SECP256K1,ED25519,ECDSA_P256,LMS,XMSS,NOOP}_ELF`.
 
 The `e2e` feature (on by default) pulls in the LEZ wallet and its whole
 dependency tree (rocksdb, keycard / `libpcsclite`, the Logos Blockchain
@@ -539,6 +625,16 @@ RISC0_DEV_MODE=0 cargo run --release --bin bench -- \
 
 # Full matrix → results/results.json + results/README-snippet.md
 RISC0_DEV_MODE=0 cargo run --release --bin bench -- --all
+
+# Public-execution matrix: execute without proving, as the sequencer
+# does for a public TX, under the 10M-cycle MAX_GAS_EXEC cap
+cargo run --release --no-default-features --bin bench -- \
+  --all --public --label public
+# → results/results-public.json + results/README-snippet-public.md
+
+# Noop guest on another scheme's fixture (input-handling cost alone)
+cargo run --release --no-default-features --bin bench -- \
+  --scheme noop --noop-fixture xmss --n 3 --public
 
 # Generate just the JSON fixture for one (scheme, N) point
 cargo run --release --bin gen_test_vectors -- \
@@ -600,8 +696,8 @@ sequencer roundtrip per row, plus six untimed deploys).
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --release --workspace
-#   12 host tests: byte-stable borsh wire format (ecdsa-k1, lms),
-#      positive + negative round-trip per scheme
+#   17 host tests: byte-stable borsh wire format (ecdsa-k1, lms),
+#      positive + negative round-trip per scheme, LMS W=1 really is W=1
 #    3 guest tests (tests/guest_exec.rs): every guest ELF run in the
 #      RISC Zero executor with the engine's input frame — commits a
 #      keep-state Transition, rejects a corrupted signature
@@ -642,13 +738,14 @@ skip themselves). Bench runs are local only.
 │           ├── schnorr_secp256k1.rs
 │           ├── ed25519.rs
 │           ├── ecdsa_p256.rs
-│           ├── lms.rs                    # hash-based / post-quantum row
+│           ├── lms.rs                    # hash-based / post-quantum rows (W=8 and W=1)
+│           ├── xmss.rs                   # hash-based / post-quantum row
 │           └── noop.rs                   # entrypoint-only calibration
 ├── src/
 │   ├── lib.rs                            # Scheme enum, fixtures, engine input frame, verify
 │   ├── verifier/                         # host-callable verify per scheme (mirrors guest)
 │   └── bin/
-│       ├── bench.rs                      # local-prove + E2E bench (single + --all)
+│       ├── bench.rs                      # local-prove, public-execution + E2E bench (single + --all)
 │       └── gen_test_vectors.rs           # write JSON fixture for one (scheme, N)
 ├── tests/guest_exec.rs                   # guest ELFs in the executor
 ├── Cargo.toml                            # workspace + [patch.crates-io] for risc0 crypto forks

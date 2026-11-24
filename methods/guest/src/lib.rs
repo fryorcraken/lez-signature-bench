@@ -126,4 +126,23 @@ pub mod verifier {
             Ok(())
         }
     }
+
+    /// XMSS (RFC 8391), XMSS-SHA2_10_256: h=10 (1024 leaves), WOTS+ w=16.
+    pub mod xmss {
+        use super::super::VerifyInput;
+        use alloc::string::{String, ToString};
+        use xmss::{DetachedSignature, VerifyingKey, XmssSha2_10_256};
+
+        pub fn verify_all(input: &VerifyInput) -> Result<(), String> {
+            for s in &input.signers {
+                let vk = VerifyingKey::<XmssSha2_10_256>::try_from(s.pubkey.as_slice())
+                    .map_err(|e| ToString::to_string(&e))?;
+                let sig = DetachedSignature::<XmssSha2_10_256>::try_from(s.signature.as_slice())
+                    .map_err(|e| ToString::to_string(&e))?;
+                vk.verify_detached(&sig, &input.message)
+                    .map_err(|e| ToString::to_string(&e))?;
+            }
+            Ok(())
+        }
+    }
 }

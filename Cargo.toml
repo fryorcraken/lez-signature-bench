@@ -47,6 +47,7 @@ k256 = { version = "0.13", default-features = false, features = ["ecdsa", "schno
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 ed25519-dalek = { version = "2.2", default-features = false, features = ["std"] }
 hbs-lms = { version = "0.2.0-alpha.1", default-features = false }
+xmss = { version = "=0.1.0-pre.0", default-features = false }
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1.50", features = ["macros", "rt-multi-thread"] }
@@ -87,6 +88,7 @@ k256 = { workspace = true, features = ["arithmetic"] }
 p256 = { workspace = true, features = ["arithmetic"] }
 ed25519-dalek.workspace = true
 hbs-lms.workspace = true
+xmss.workspace = true
 sha2.workspace = true
 tiny-keccak.workspace = true
 clap.workspace = true

@@ -8,6 +8,7 @@ use lez_signature_bench::{
 };
 use lez_signature_bench_methods::{
     ECDSA_P256_ELF, ECDSA_SECP256K1_ELF, ED25519_ELF, LMS_ELF, NOOP_ELF, SCHNORR_SECP256K1_ELF,
+    XMSS_ELF,
 };
 use risc0_zkvm::{ExecutorEnv, default_executor};
 
@@ -17,7 +18,8 @@ fn elf_for(scheme: Scheme) -> &'static [u8] {
         Scheme::SchnorrSecp256k1 => SCHNORR_SECP256K1_ELF,
         Scheme::Ed25519 => ED25519_ELF,
         Scheme::EcdsaP256 => ECDSA_P256_ELF,
-        Scheme::Lms => LMS_ELF,
+        Scheme::Lms | Scheme::LmsW1 => LMS_ELF,
+        Scheme::Xmss => XMSS_ELF,
     }
 }
 

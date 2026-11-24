@@ -21,7 +21,9 @@ consumer hardware.
 - LMS (RFC 8554, hash-based, post-quantum) — included as a
   "post-quantum cost on this stack" data point. Not RISC0-precompiled
   in the curve sense, but its inner SHA-256 calls dispatch to the SHA
-  precompile via the patched `sha2` crate.
+  precompile via the patched `sha2` crate. Benched at W=8 and W=1.
+- XMSS (RFC 8391, hash-based, post-quantum), `XMSS-SHA2_10_256` — the
+  other standardized stateful hash-based scheme; same SHA-256 path.
 
 **Multiplicities:** N = 1 and N = 3 (3-of-5 RedStone-shaped, same
 message across all signers).
@@ -59,8 +61,12 @@ decision note are the primary artifacts.
   - `hbs-lms 0.2.0-alpha.1` (Fraunhofer AISEC, pure-Rust, `no_std`).
     No RISC0 fork exists; acceleration comes solely from its `sha2`
     dependency hitting the SHA precompile via the workspace patch.
-    Parameters used: `Sha256_256` / `LmotsW8` / `LmsH5` (single-tree HSS,
-    32 leaves, smallest signature tradeoff).
+    Parameters used: `Sha256_256` / `LmsH5` (single-tree HSS, 32 leaves)
+    with `LmotsW8` (smallest signature) and `LmotsW1` (fewest chain
+    steps). One guest verifies both: the type codes are in the signature.
+  - `xmss 0.1.0-pre.0` (RustCrypto/signatures, pre-release, `no_std`).
+    `XmssSha2_10_256` (h=10, WOTS+ w=16). No RISC0 fork; acceleration
+    comes from the patched `sha2`, as for LMS.
 
 ## 3. Commands
 
@@ -70,6 +76,7 @@ decision note are the primary artifacts.
 | `cargo run --release --bin gen_test_vectors -- --scheme <s> --n <n>` | Produce a deterministic synthetic fixture for one (scheme, N) point. |
 | `cargo run --release --bin bench -- --scheme <s> --n <n> --account-id <id>` | Run a single bench point as a real private TX; print cycles, prove_time, receipt_size, tx_e2e. |
 | `cargo run --release --bin bench -- --all --account-id <id>` | Run the full matrix; write `results/results.json` and a Markdown table snippet. |
+| `cargo run --release --bin bench -- --all --public` | Run the full matrix as public execution (executor only, no proof, 10M-cycle `MAX_GAS_EXEC` cap); print cycles and execution time. |
 | `cargo test --workspace` | Host-side fixture round-trip + executor-mode guest sanity per scheme. |
 | `cargo fmt --all --check` | Format check (CI). |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Lint (CI). |
@@ -228,8 +235,8 @@ The bench is complete when **all** of these are demonstrably true:
   headline matrix. Optional follow-up if 3-of-5 numbers warrant.
 - **N > 3 or N-sweep.** Only the winning scheme might get a sweep, and
   only if the budget framing demands it.
-- **BLS, RSA, Lamport, SPHINCS+.** Out of scope. (LMS is the one
-  hash-based / post-quantum scheme included — see §1.)
+- **BLS, RSA, Lamport, SPHINCS+.** Out of scope. (LMS and XMSS are the
+  hash-based / post-quantum schemes included — see §1.)
 - **Multi-machine numbers.** Single machine only; cycles generalize,
   prove-time doesn't.
 - **Production deployment** of any scheme. Measurement only.
