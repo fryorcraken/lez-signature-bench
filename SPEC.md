@@ -37,8 +37,11 @@ decision note are the primary artifacts.
 
 ## 2. Tech Stack
 
-- LEZ `dev` @ `dcbd318f0` — the v0.4 actor model (`lee`, `lee_core`,
-  `program_loader_core`, `wallet`). Originally written against
+- LEZ @ `98c3f9e` — `dev` @ `dcbd318f0` (the v0.4 actor model: `lee`,
+  `lee_core`, `program_loader_core`, `wallet`) plus the fee
+  optimizations of logos-execution-zone#1146. Local-prove and public
+  numbers were measured at `dcbd318f0`; guest cycle counts are
+  identical at both. Originally written against
   v0.2.0-rc3 (`nssa`, `nssa_core`, `wallet`, `common`); see the README
   for the migration and the before/after numbers.
 - `risc0-zkvm` 3.1.0 (was 3.0.5)

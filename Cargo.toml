@@ -27,12 +27,14 @@ panic = "abort"
 strip = true
 
 [workspace.dependencies]
-# LEZ `dev` (the v0.4 actor model, PR #935). There is no `master`; `main`
-# predates the actor model. Pinned by rev so the numbers are reproducible.
-lee = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", rev = "dcbd318f0f2ef601fc93e67e0dabc49895d811ef" }
-lee_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", rev = "dcbd318f0f2ef601fc93e67e0dabc49895d811ef" }
-program_loader_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", rev = "dcbd318f0f2ef601fc93e67e0dabc49895d811ef" }
-wallet = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", rev = "dcbd318f0f2ef601fc93e67e0dabc49895d811ef" }
+# LEZ `dev` (the v0.4 actor model, PR #935) plus the fee optimizations of
+# PR #1146, at that PR's pre-merge head 98c3f9e (it merged into `dev` as
+# f91a770, rebased). There is no `master`; `main` predates the actor model.
+# Pinned by rev so the numbers are reproducible.
+lee = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", rev = "98c3f9e4430c1a2b8feb4203a16566bcfc411ec6" }
+lee_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", rev = "98c3f9e4430c1a2b8feb4203a16566bcfc411ec6" }
+program_loader_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", rev = "98c3f9e4430c1a2b8feb4203a16566bcfc411ec6" }
+wallet = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", rev = "98c3f9e4430c1a2b8feb4203a16566bcfc411ec6" }
 
 risc0-zkvm = { version = "3.1.0", features = ["std"] }
 risc0-build = "3.0.7"
