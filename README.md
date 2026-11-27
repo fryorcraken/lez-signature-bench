@@ -10,9 +10,10 @@
 A comparative benchmark of common signature-verification schemes
 inside the [Logos Execution Zone (LEZ)](https://github.com/logos-blockchain/logos-execution-zone)
 guest model on the [RISC Zero zkVM](https://risczero.com/). Each scheme
-runs inside an NSSA-wrapped guest using RISC Zero's accelerated curve
-arithmetic, and is benchmarked end-to-end through the local prover
-(private transactions) and the executor (public transactions).
+runs inside a LEZ actor-model guest (`lee_core::actor_entrypoint!`, LEZ
+`dev`) using RISC Zero's accelerated curve arithmetic, and is benchmarked
+through the local prover and end-to-end as a private transaction, and
+through the executor as a public transaction.
 
 The goal is *data*, not deployment: cycles, prove time, and receipt
 size for each scheme so a developer choosing a verification primitive
@@ -28,7 +29,7 @@ See [`SPEC.md`](./SPEC.md) for acceptance criteria and
 |---|---|---|---|
 | ECDSA secp256k1 | secp256k1 | keccak256 | `k256/v0.13.4-risczero.1` |
 | Schnorr secp256k1 (BIP-340) | secp256k1 | sha256 | (same fork as ECDSA) |
-| Ed25519 | Curve25519 | none (sha512 internal) | `curve25519-4.1.3-risczero.0` |
+| Ed25519 | Curve25519 | none (sha512 internal) | `curve25519-4.1.3-risczero.0` (curve25519-dalek; ed25519-dalek 2.2.0 from crates.io) |
 | ECDSA P-256 | NIST P-256 | sha256 | `p256/v0.13.2-risczero.1` |
 | LMS (RFC 8554), W=8 | hash-based, post-quantum | sha256 (whole construction) | `hbs-lms 0.2.0-alpha.1` (no RISC0 fork; rides the patched `sha2`) |
 | LMS (RFC 8554), W=1 | hash-based, post-quantum | sha256 (whole construction) | same crate and guest as W=8 |
@@ -38,7 +39,10 @@ The four EC schemes hit RISC Zero's `bigint2` / curve precompile path —
 verified in the Phase 1 spike. Schnorr secp256k1 routes through the
 same `ProjectivePoint::lincomb` accelerated path that ECDSA secp256k1
 uses (no separate code path); Ed25519 uses curve25519-dalek's
-`backend/serial/risc0` module. **LMS** has no RISC0 fork; its only
+`backend/serial/risc0` module. (Only curve25519-dalek is patched, as in
+LEZ itself; LEZ `dev` needs `ed25519-dalek ^2.2`, so the risc0 fork's
+2.1.1 copy is no longer used. Per-sig Ed25519 cycles moved +1.8%, so the
+accelerated backend is still in play.) **LMS** has no RISC0 fork; its only
 acceleration is the SHA-256 precompile reached transitively through
 the patched `sha2` crate. Parameters used: `Sha256_256` / `LmsH5`
 (single-tree HSS, 32 leaves) with `LmotsW8` (`lms`, smallest signature)
@@ -49,73 +53,137 @@ WOTS+ w=16); like LMS, its only acceleration is the SHA-256 precompile.
 
 ## Results
 
-Real-prove run, single-pass per cell on an idle machine. NSSA-wrapped
-guests, `RISC0_DEV_MODE=0`, one synthetic same-message fixture per
-`(scheme, N)`.
+Real-prove runs, three runs per cell; prove times are the median, with
+the min–max range alongside. `RISC0_DEV_MODE=0`, one synthetic
+same-message fixture per `(scheme, N)`.
 
 **Machine:** AMD Ryzen 9 7940HS (16 threads, AMD Radeon 780M iGPU,
-60 GiB RAM), Linux 6.19, CPU prover (no CUDA, no Bonsai).
-**Stack:** risc0-zkvm 3.0.5, LEZ v0.2.0-rc3, Rust 1.92.0.
+60 GiB RAM), Linux 7.3, CPU prover (no CUDA, no Bonsai), on AC with
+the `performance` governor, inside a rootless podman container (no
+cgroup CPU or memory limits, never throttled). While proving, the CPU
+sits at its 100 °C limit (`k10temp` Tctl) and runs all cores at
+~3.7 GHz (5.26 GHz max), so prove time depends on cooling. Other host
+activity averaged 0.7–0.9 of 16 cores during the two monitored
+`dcbd318` runs (see [Run-to-run variance](#run-to-run-variance)); the
+`98c3f9e` E2E run had much more (see below).
+**Stack:** LEZ `dev` @ [`dcbd318f0`](https://github.com/logos-blockchain/logos-execution-zone/commit/dcbd318f0f2ef601fc93e67e0dabc49895d811ef)
+(the v0.4 actor model; there is no `master`, and `main` predates the
+actor model) for the local-prove and public-execution numbers. The
+crate now pins
+[`98c3f9e`](https://github.com/logos-blockchain/logos-execution-zone/commit/98c3f9e4430c1a2b8feb4203a16566bcfc411ec6)
+(`dcbd318f0` plus the fee optimizations of
+logos-blockchain/logos-execution-zone#1146), where our guests' cycle
+counts are identical and the [E2E numbers](#end-to-end-private-tx-time-against-a-local-lez-sequencer)
+were measured; risc0-zkvm 3.1.0 with r0vm 3.1.0, risc0 guest toolchain
+Rust 1.94.1, host Rust 1.98.1. Same tight `[profile.release]` as before
+([Pass 3](#optimization-passes)).
 
-After applying the [Pass 3 optimizations](#optimization-passes) (workspace-wide
-`[profile.release]` with `lto="fat"`, `codegen-units=1`, `panic="abort"`,
-`strip=true`):
+| scheme | N | total cycles | user cycles | segments | prove time (median) | range | receipt size (B) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `noop` | 1 | 32 768 | 7 201 | 1 | 4.3 s (~0:04) | 3.9–4.4 s | 210 058 |
+| `ecdsa-secp256k1` | 1 | 524 288 | 311 082 | 1 | 137.5 s (~2:18) | 114.9–140.7 s | 491 815 |
+| `ecdsa-secp256k1` | 3 | 1 048 576 | 905 444 | 1 | 207.6 s (~3:28) | 207.6–211.4 s | 505 483 |
+| `schnorr-secp256k1` | 1 | 524 288 | 278 821 | 1 | 66.1 s (~1:06) | 64.9–68.4 s | 268 680 |
+| `schnorr-secp256k1` | 3 | 1 048 576 | 822 978 | 1 | 147.5 s (~2:27) | 133.6–157.1 s | 282 344 |
+| `ed25519` | 1 | 1 048 576 | 825 288 | 1 | 138.8 s (~2:19) | 127.5–139.4 s | 281 928 |
+| `ed25519` | 3 | 3 145 728 | 2 462 279 | 3 | 390.4 s (~6:30) | 382.5–416.2 s | 845 076 |
+| `ecdsa-p256` | 1 | 262 144 | 205 310 | 1 | 31.9 s (~0:32) | 31.7–33.1 s | 256 458 |
+| `ecdsa-p256` | 3 | 1 048 576 | 592 783 | 1 | 130.8 s (~2:11) | 127.8–134.8 s | 282 350 |
+| `lms` | 1 | 3 145 728 | 2 659 761 | 3 | 398.6 s (~6:39) | 381.7–420.6 s | 847 180 |
+| `lms` | 3 | 8 519 680 | 8 130 131 | 9 | 1116.8 s (~18:37) | 1055.6–1242.1 s | 2 503 648 |
 
-| scheme | N | total cycles | user cycles | segments | prove time | receipt size (B) |
-|---|---:|---:|---:|---:|---:|---:|
-| `noop` | 1 | 65 536 | 38 623 | 1 | 9.00 s (~0:09) | 222 266 |
-| `ecdsa-secp256k1` | 1 | 524 288 | 342 000 | 1 | 146.80 s (~2:26) | 492 375 |
-| `ecdsa-secp256k1` | 3 | 1 081 344 | 988 083 | 2 | 260.06 s (~4:20) | 716 649 |
-| `schnorr-secp256k1` | 1 | 524 288 | 309 274 | 1 | 72.51 s (~1:12) | 269 234 |
-| `schnorr-secp256k1` | 3 | 1 048 576 | 903 957 | 1 | 146.69 s (~2:26) | 284 050 |
-| `ed25519` | 1 | 1 048 576 | 841 867 | 1 | 160.43 s (~2:40) | 282 482 |
-| `ed25519` | 3 | 3 145 728 | 2 501 609 | 3 | 460.65 s (~7:40) | 846 678 |
-| `ecdsa-p256` | 1 | 524 288 | 236 869 | 1 | 69.52 s (~1:09) | 269 242 |
-| `ecdsa-p256` | 3 | 1 048 576 | 677 267 | 1 | 142.29 s (~2:22) | 284 074 |
-| `lms` | 1 | 3 145 728 | 2 720 550 | 3 | 531.95 s (~8:51) | 855 190 |
-| `lms` | 3 | 8 912 896 | 8 281 737 | 9 | 1 349.76 s (~22:29) | 2 551 554 |
+The `noop` row is the entrypoint-only calibration baseline: the actor
+entrypoint reads the framed `ReceiveInput`, borsh-decodes the
+`VerifyInput` message and commits the `Transition`, with no crypto
+(7 201 user cycles). Subtract it from any other row for the per-scheme
+verify cost in cycles. `ecdsa-secp256k1`'s larger receipt and longer
+prove time are the keccak coprocessor (see
+[Keccak coprocessor note](#keccak-coprocessor-note)). Cycle counts are
+identical in every run; prove time spreads 2–19% (max − min over
+median) between runs (see [Run-to-run variance](#run-to-run-variance)).
 
 `lms-w1` and `xmss` have not been proven yet; their cycle counts are in
 [Public execution](#public-execution-no-proof).
 
-The `noop` row is the NSSA-wrap-only calibration baseline (52 705 user
-cycles with empty pre-states, no crypto). Subtract it from any other
-row for the per-scheme verify cost in cycles. Note `ecdsa-secp256k1`
-shows a much larger receipt than other schemes at N=1; this is driven
-by the segment-padding power-of-two and may also reflect the ELF that
-keccak256 + k256 path pulls in. Re-runs may vary ±10% on prove time.
+**Prove time follows the padded segment size, not the cycle count.**
+Every row without keccak lands on the same curve: ~4.3 s for a 2^15
+segment, ~32 s for 2^18, ~66 s for 2^19 and ~130–150 s per 2^20
+segment (≈ 120–140 µs per padded cycle). Trimming cycles only pays when
+it crosses a power-of-two boundary. LEZ's own `cycle_bench` reports the
+same shape at ~73 µs per padded cycle on an Apple M2 Pro (see
+[Comparison with LEZ's own benchmarks](#comparison-with-lezs-own-benchmarks)).
+
+### LEZ v0.2.0-rc3 → `dev`: what changed
+
+Same fixtures (the borsh wire-format test is derived from the old
+bincode capture, so the signed bytes are identical), same machine, same
+release profile:
+
+| scheme | N | user cycles (rc3 → dev) | Δ | prove time (rc3 → dev median) | Δ |
+|---|---:|---:|---:|---:|---:|
+| `noop` | 1 | 38 623 → 7 201 | -81% | 9.0 s → 4.3 s (po2 16→15) | -52% |
+| `ecdsa-secp256k1` | 1 | 342 000 → 311 082 | -9% | 146.8 s → 137.5 s | -6% |
+| `ecdsa-secp256k1` | 3 | 988 083 → 905 444 | -8% | 260.1 s → 207.6 s (2→1 segs) | -20% |
+| `schnorr-secp256k1` | 1 | 309 274 → 278 821 | -10% | 72.5 s → 66.1 s | -9% |
+| `schnorr-secp256k1` | 3 | 903 957 → 822 978 | -9% | 146.7 s → 147.5 s | +1% |
+| `ed25519` | 1 | 841 867 → 825 288 | -2% | 160.4 s → 138.8 s | -13% |
+| `ed25519` | 3 | 2 501 609 → 2 462 279 | -2% | 460.6 s → 390.4 s | -15% |
+| `ecdsa-p256` | 1 | 236 869 → 205 310 | -13% | 69.5 s → 31.9 s (po2 19→18) | -54% |
+| `ecdsa-p256` | 3 | 677 267 → 592 783 | -12% | 142.3 s → 130.8 s | -8% |
+| `lms` | 1 | 2 720 550 → 2 659 761 | -2% | 532.0 s → 398.6 s | -25% |
+| `lms` | 3 | 8 281 737 → 8 130 131 | -2% | 1349.8 s → 1116.8 s | -17% |
+
+- **The fixed entrypoint cost fell 81%** (38 623 → 7 201 user cycles).
+  The v0.2 NSSA guest read `self_program_id`, `caller_program_id`, the
+  pre-states and a risc0-serde instruction, then wrote every pre-state
+  back as a post-state. The actor guest reads one borsh frame and
+  returns `Response::keep_state()`. That ~31K-cycle saving is the
+  entire delta for the ECDSA, Schnorr and P-256 rows.
+- **Per-signature verify cost is unchanged** within ±2% (see below):
+  the crypto crates and risc0 patches are the same. The outliers are
+  Ed25519 (+1.8%/sig, from `ed25519-dalek` 2.1.1 → 2.2.0) and LMS
+  (−1.1%/sig, not investigated; plausibly codegen from the newer guest
+  toolchain).
+- **Prove time fell where a row crossed a boundary.** `ecdsa-p256`
+  N=1 now fits a 2^18 segment (**69.5 s → 31.9 s**), `ecdsa-secp256k1`
+  N=3 now fits one segment instead of two, and `noop` dropped to 2^15.
+  Rows with the same segment shape are mixed: `ed25519` N=1 (−2%
+  cycles) is 13% faster, while `schnorr-secp256k1` N=3 (−9% cycles) is
+  flat. The rc3 side is a single run and runs here spread up to 19%,
+  so those residuals are within noise; the risc0 3.0.5 → 3.1.0 prover
+  change was not isolated.
 
 ### Per-signature cycle deltas (subtracting noop)
 
-| scheme | user cycles / sig (N=1) | user cycles / sig (≈ from N=3) |
-|---|---:|---:|
-| ecdsa-secp256k1 | 303 377 | 316 487 |
-| schnorr-secp256k1 | 270 651 | 288 445 |
-| ecdsa-p256       | 198 246 | 212 881 |
-| ed25519          | 803 244 | 820 995 |
-| lms              | 2 681 927 | 2 747 705 |
+| scheme | user cycles / sig (N=1) | user cycles / sig (≈ from N=3) | v0.2.0-rc3, N=1 |
+|---|---:|---:|---:|
+| ecdsa-secp256k1 | 303 881 | 299 414 | 303 377 |
+| schnorr-secp256k1 | 271 620 | 271 926 | 270 651 |
+| ecdsa-p256 | 198 109 | 195 194 | 198 246 |
+| ed25519 | 818 087 | 818 359 | 803 244 |
+| lms | 2 652 560 | 2 707 643 | 2 681 927 |
 
 **Headline takes:**
 
 - **P-256 ECDSA is the cheapest** verify on this stack — about
-  **32% fewer cycles per sig than secp256k1 ECDSA** at N=1. The same
-  RISC0 `bigint2` curve precompile applies and the field is similar
-  cost; what differs is keccak256 (k256 path) vs sha256 (p256 path)
-  for the message digest.
-- **Schnorr secp256k1 ≈ 9% cheaper than ECDSA secp256k1** per sig.
+  **35% fewer cycles per sig than secp256k1 ECDSA** at N=1, and the only
+  scheme whose N=1 proof fits a 2^18 segment (~32 s). The same RISC0
+  `bigint2` curve precompile applies and the field is similar cost; what
+  differs is keccak256 (k256 path) vs sha256 (p256 path) for the message
+  digest.
+- **Schnorr secp256k1 ≈ 11% cheaper than ECDSA secp256k1** per sig.
   The expected win from skipping the modular inversion is partially
   offset by Schnorr's `ProjectivePoint::lincomb(G, s, P, -e)` doing
   one combined mul vs ECDSA's separate mul + recovery. Same precompile
   path, smaller win than naive theory predicts.
-- **Ed25519 is by far the most expensive** here — **2.7× the user
+- **Ed25519 is by far the most expensive** EC scheme — **2.7× the user
   cycles** of secp256k1 ECDSA. The RISC0 curve25519-dalek backend is
   available and active, but Edwards arithmetic plus the in-algorithm
   sha512 (no zkVM precompile) dominates.
-- **Multi-sig scaling is roughly linear** for all schemes — about
-  **+320–340K user cycles per added secp256k1 sig**, **+870K** per
-  Ed25519 sig. No batch-verify shortcuts here (out of scope per
-  [`SPEC.md`](./SPEC.md) §9).
-- **LMS is ~8× the cycles and ~3.5× the prove time of secp256k1
+- **Multi-sig scaling is linear** for all schemes — about **+300K user
+  cycles per added secp256k1 ECDSA sig**, **+820K** per Ed25519 sig. No
+  batch-verify shortcuts here (out of scope per [`SPEC.md`](./SPEC.md) §9).
+- **LMS is ~8.7× the cycles and ~2.9× the prove time of secp256k1
   ECDSA at N=1**, with a receipt 1.7× as large. Per-sig delta scales
   cleanly (~2.7M user cycles/sig). The SHA precompile carries the
   inner work, but signature parsing in `tinyvec` arrays + LM-OTS hash
@@ -126,178 +194,480 @@ keccak256 + k256 path pulls in. Re-runs may vary ±10% on prove time.
   signing is *stateful* (the signer must persist a leaf counter; reuse
   breaks security), and the keypair is one-shot exhausted after 2^h
   signatures (h=5 → 32 sigs in this configuration).
+- **Oracle notes:** see [Oracle signing: DIA vs RedStone](#oracle-signing-dia-vs-redstone).
+  Both sign feeds with ECDSA secp256k1, so the `ecdsa-secp256k1` rows
+  are the ones that apply to them today.
+
+### Oracle signing: DIA vs RedStone
+
+Read from the oracles' own contracts and SDKs
+(diadata-org/Spectra-interoperability @ `b1b4fb9`,
+redstone-finance/redstone-oracles-monorepo @ `251d6a4`,
+redstone-finance/rust-sdk @ `05e3c9f`):
+
+| | DIA (Lumina intents) | RedStone (pull payload) |
+|---|---|---|
+| Scheme | ECDSA secp256k1, 65-byte r‖s‖v, low-s enforced | ECDSA secp256k1, 65-byte r‖s‖v, low-s enforced |
+| Digest | EIP-712: `keccak(0x1901 ‖ domainSeparator ‖ structHash)` over a 9-field struct (intentType, version, chainId, nonce, expiry, symbol, price, timestamp, source) ([`OracleIntentUtils.sol`](https://github.com/diadata-org/Spectra-interoperability/blob/main/contracts/contracts/libs/OracleIntentUtils.sol)) | plain `keccak256` of the raw data package (feed id ‖ value per data point, then timestamp ‖ value size ‖ count; 77 B for one feed), no `eth_sign` prefix |
+| Signer check | `ecrecover` must equal the intent's `signer`, which must be on an owner-managed allowlist: **1-of-n** | `ecrecover` on every package, unique-signer bitmap, **3-of-5** hard-coded production signers |
+| Other checks | replay by hash, newer timestamp wins; the registry checks expiry | all package timestamps equal, at most 3 min old / 1 min ahead; median of the values |
+| Signatures per update | 1 per symbol (batches are separate signed intents) | 3 per feed, **each over a different message** (each node signs its own value) |
+| Other schemes | none found | non-EVM connectors (Solana, Sui, Starknet, …) still use secp256k1 recovery; RedStone's EigenLayer AVS uses BLS aggregation (docs only) |
+
+What a verifier on LEZ costs, from the rows above:
+
+- **DIA ≈ `ecdsa-secp256k1` N=1** (~2:18 local prove, ~11:51 end to
+  end, medians), plus ~5 small keccak calls for the EIP-712 hashes
+  instead of our 1. The signer's address is in the struct, so the guest
+  can verify against a known public key instead of recovering it.
+- **RedStone ≈ `ecdsa-secp256k1` N=3** (~3:28 local, ~12:54 end to end,
+  medians), with one difference from our fixtures: the 3 signers sign
+  3 different packages, so it needs 3 package hashes rather than 1
+  shared digest. The payload does not name its signers, so a guest
+  either recovers each key (one more keccak each) or takes a signer
+  hint from the host and verifies against allowlisted keys. Add payload
+  parsing, the uniqueness and freshness checks and the median, all small
+  in cycles next to the signature verifies.
+- Neither oracle signs with Schnorr or P-256, so the cheaper rows would
+  need the oracle to change its signing scheme.
 
 ### Decision note: budget → scheme on this laptop
 
-Given the prove times above on a CPU-only Ryzen 9 7940HS:
+Given the local prove times above on a CPU-only Ryzen 9 7940HS (the
+inner proof only; see the end-to-end section for what a private TX
+adds):
 
 | TX prove budget | What fits |
 |---|---|
-| **15 s** | `noop` baseline (~0:09, no crypto) |
-| **1 min** | nothing in scope |
-| **1.5 min** | `ecdsa-p256` n=1 (~1:09); `schnorr-secp256k1` n=1 (~1:12) |
-| **3 min** | adds `ecdsa-p256` n=3 (~2:22), `schnorr-secp256k1` n=3 (~2:26), `ecdsa-secp256k1` n=1 (~2:26), `ed25519` n=1 (~2:40) |
-| **5 min** | adds `ecdsa-secp256k1` n=3 (~4:20) |
-| **8 min** | adds `ed25519` n=3 (~7:40) |
-| **10 min** | adds `lms` n=1 (~8:51) |
-| **25 min** | adds `lms` n=3 (~22:29) |
+| **15 s** | `noop` baseline (~0:04, no crypto) |
+| **1 min** | `ecdsa-p256` n=1 (~0:32) |
+| **1.5 min** | adds `schnorr-secp256k1` n=1 (~1:06) |
+| **2.5 min** | adds `ecdsa-p256` n=3 (~2:11), `ecdsa-secp256k1` n=1 (~2:18), `ed25519` n=1 (~2:19), `schnorr-secp256k1` n=3 (~2:27) |
+| **4 min** | adds `ecdsa-secp256k1` n=3 (~3:28) |
+| **7 min** | adds `ed25519` n=3 (~6:30), `lms` n=1 (~6:39) |
+| **20 min** | adds `lms` n=3 (~18:37) |
+
+Times are medians. The slowest of the three runs is up to ~11% above
+the median (`schnorr-secp256k1` n=3 reached 2:37, `lms` n=1 7:01, `lms`
+n=3 20:42), so leave that much headroom.
 
 For interactive RedStone-style oracle UX (3-of-N pulls, sub-30 s),
-**no scheme fits on CPU**. CUDA / Bonsai would compress this
-dramatically; CPU alone is too heavy for low-latency UX.
+**no scheme fits on CPU** even before the private-TX wrapping. CUDA /
+Bonsai would compress this dramatically; CPU alone is too heavy for
+low-latency UX.
 
-For batch / async workloads (sub-5 min acceptable), **secp256k1 Schnorr
-or P-256 at N=3** is the budget pick. If keys / addresses must stay
-secp256k1 (Ethereum compat), Schnorr is the natural step up from ECDSA.
+For batch / async workloads, **P-256 or secp256k1 Schnorr at N=3** is
+the budget pick. If keys / addresses must stay secp256k1 (Ethereum
+compat, DIA), Schnorr is the natural step up from ECDSA.
 
-### End-to-end private-TX time (against `lgs localnet`)
+For **public** transactions there is no proof, so the budget is
+execution gas instead of time (see
+[Public execution](#public-execution-no-proof)). Every curve scheme
+verifies 3 signers in under 10% of the 10M per-transaction cap. If the
+verifier has to be post-quantum, LMS W=1 costs about the same gas as
+ECDSA and is the only hash-based row that leaves room in the block at
+N=3. LMS W=8 takes 81% of the cap and XMSS goes over it.
+
+### End-to-end private-TX time (against a local LEZ sequencer)
 
 The numbers above isolate the inner proving cost. The number a user
-actually feels — "click submit on a privacy-preserving transaction →
-confirmation back from the sequencer" — adds NSSA framing, the
-privacy-preserving circuit (which proves the account-state transition
-on top of our verifier), and the sequencer roundtrip. Measured against
-a fresh `lgs localnet` and a fresh `PrivateOwned` account, same
-machine, same `RISC0_DEV_MODE=0`. **These rows were captured against
-the *pre-optimization* binaries**, so they're a slight overestimate
-relative to the optimized local-prove table above (re-running E2E
-against the optimized binaries is left as future work):
+actually feels, from submitting a privacy-preserving transaction to the
+sequencer accepting it, adds the privacy-preserving circuit (which
+proves the actor transition and the in-proof fee payment on top of our
+verifier), compression to a succinct receipt, and the RPC submission.
+It does not include waiting for a block:
+`send_privacy_preserving_tx` returns once the sequencer accepts the
+transaction (the wallet CLI polls for inclusion separately).
 
-| scheme | N | E2E private TX | local prove (baseline) | wrap overhead |
-|---|---:|---:|---:|---:|
-| `noop`              | 1 | 103.46 s (~1:43) | 23.15 s (~0:23) | +80.3 s (+347%) |
-| `ecdsa-secp256k1`   | 1 | 246.46 s (~4:06) | 141.47 s (~2:21) | +105.0 s (+74%) |
-| `ecdsa-secp256k1`   | 3 | 446.12 s (~7:26) | 260.13 s (~4:20) | +186.0 s (+72%) |
-| `schnorr-secp256k1` | 1 | 153.67 s (~2:33) | 77.82 s (~1:18) | +75.9 s (+97%) |
-| `schnorr-secp256k1` | 3 | 322.95 s (~5:22) | 166.46 s (~2:46) | +156.5 s (+94%) |
-| `ed25519`           | 1 | 282.95 s (~4:42) | 153.97 s (~2:34) | +129.0 s (+84%) |
-| `ed25519`           | 3 | 669.66 s (~11:09) | 451.82 s (~7:32) | +217.8 s (+48%) |
-| `ecdsa-p256`        | 1 | 152.50 s (~2:32) | 71.44 s (~1:11) | +81.1 s (+113%) |
-| `ecdsa-p256`        | 3 | 298.82 s (~4:58) | 141.36 s (~2:21) | +157.5 s (+111%) |
+**The current numbers are at LEZ
+[`98c3f9e`](https://github.com/logos-blockchain/logos-execution-zone/commit/98c3f9e4430c1a2b8feb4203a16566bcfc411ec6)**,
+the head of logos-blockchain/logos-execution-zone#1146 on top of
+`dcbd318f0`. That PR optimizes the in-proof fee: the fee fallback note
+and the fee recovery binding share the payer note's encapsulation, the
+fallback no longer carries its own copy of the ephemeral key, and the
+guests (the privacy circuit included) are built with fat LTO and one
+codegen unit. #1146 has since merged into `dev` as `f91a770`, rebased
+onto newer `dev`; this crate pins the commit that was measured. Our
+guests' cycle counts are identical at `dcbd318f0` and `98c3f9e`
+(checked row by row in public mode), so the local-prove table above
+still holds, and wrap overhead is E2E minus that local-prove median.
 
-The privacy-preserving wrapping adds **roughly 75–220 s** per TX. It's
-not a fixed overhead: there's a constant component (~80 s, visible on
-the `noop` row) plus a variable component that scales with the inner
-kernel's segment count. Larger kernels (e.g. `ed25519` N=3) see a lower
-*percentage* overhead because the fixed component is amortized.
+Measured on 2026-11-27 against a fresh standalone sequencer at
+`98c3f9e` (sequencer `RISC0_DEV_MODE=1`, client `RISC0_DEV_MODE=0`),
+with one funded private account reused across rows. **Each row is a
+single run, on a busy host.** Outside load kept the load average at
+~6 before the run and 22–35 (median 26) during it, with 41–52 of
+60 GB of RAM in use. The `dcbd318` column is the previous median of
+three runs, one of them on an idle host, so the new times are, if
+anything, pessimistic. The rc3 column is a single run.
 
-Scheme ranking carries over from local-prove to E2E unchanged:
-`ecdsa-p256` ≈ `schnorr-secp256k1` < `ecdsa-secp256k1` < `ed25519`.
-The wrap overhead compresses the spread (Ed25519 is ~1.9× ECDSA-k1 in
-E2E vs ~2.7× in user cycles), so for end-user latency the gap is real
-but smaller than the cycle deltas suggest.
+| scheme | N | E2E at `98c3f9e` | E2E at `dcbd318` (median of 3) | Δ | local prove (median) | wrap overhead (`dcbd318` → `98c3f9e`) | v0.2.0-rc3 E2E |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `noop` | 1 | **315.8 s (~5:16)** | 610.1 s (~10:10) | −48% | 4.3 s | +606 s → +312 s | 103.5 s (~1:43) |
+| `ecdsa-secp256k1` | 1 | **485.7 s (~8:06)** | 711.1 s (~11:51) | −32% | 137.5 s | +574 s → +348 s | 246.5 s (~4:06) |
+| `ecdsa-secp256k1` | 3 | **569.3 s (~9:29)** | 774.5 s (~12:54) | −26% | 207.6 s | +567 s → +362 s | 446.1 s (~7:26) |
+| `schnorr-secp256k1` | 1 | **390.2 s (~6:30)** | 646.4 s (~10:46) | −40% | 66.1 s | +580 s → +324 s | 153.7 s (~2:34) |
+| `schnorr-secp256k1` | 3 | **477.0 s (~7:57)** | 739.0 s (~12:19) | −35% | 147.5 s | +592 s → +329 s | 323.0 s (~5:23) |
+| `ed25519` | 1 | **482.6 s (~8:03)** | 740.6 s (~12:21) | −35% | 138.8 s | +602 s → +344 s | 283.0 s (~4:43) |
+| `ed25519` | 3 | **802.1 s (~13:22)** | 1047.2 s (~17:27) | −23% | 390.4 s | +657 s → +412 s | 669.7 s (~11:10) |
+| `ecdsa-p256` | 1 | **365.1 s (~6:05)** | 621.2 s (~10:21) | −41% | 31.9 s | +589 s → +333 s | 152.5 s (~2:33) |
+| `ecdsa-p256` | 3 | **472.3 s (~7:52)** | 717.1 s (~11:57) | −34% | 130.8 s | +586 s → +342 s | 298.8 s (~4:59) |
+| `lms` | 1 | **802.3 s (~13:22)** | 1014.0 s (~16:54) | −21% | 398.6 s | +615 s → +404 s | — |
+| `lms` | 3 | **1782.6 s (~29:43)** | 1811.2 s (~30:11) | −2% | 1116.8 s | +694 s → +666 s | — |
+| `lms-w1` | 1 | **473.4 s (~7:53)** | — | — | not proven locally | — | — |
+| `lms-w1` | 3 | **688.9 s (~11:29)** | — | — | not proven locally | — | — |
+| `xmss` | 1 | **1042.1 s (~17:22)** | — | — | not proven locally | — | — |
+| `xmss` | 3 | **2548.0 s (~42:28)** | — | — | not proven locally | — | — |
 
-Net for the headline RedStone shape — **3-of-N pull, end-to-end**:
+- **The fee optimizations cut the fixed private-TX cost by ~250 s,
+  about 42%.** For any kernel that fits one segment, the wrap overhead
+  is now ~310–360 s, down from ~570–610 s at `dcbd318`. A `noop` private
+  TX takes 5:16 instead of 10:10.
+- **The privacy circuit runs 2.9× fewer user cycles.** Executing one
+  `noop` private TX with `RISC0_INFO=1` (dev mode) puts the
+  privacy-preserving circuit at **1 310 720 total / 980 967 user cycles
+  in 2 segments** (643 SHA-256 calls, 62 keccak). At `dcbd318` it was
+  3 407 872 total / 2 818 870 user cycles in 4 segments (1 711 SHA-256,
+  192 keccak). erhant's profile of the same transaction (on #1146)
+  attributes the cut to the two ~856K-cycle ML-KEM encapsulations the
+  fee no longer does, plus ~19% from fat LTO. Wall-clock falls less
+  than cycles (−42% against −65%), because composing the deployed
+  program's receipt and compressing to a succinct receipt are
+  unchanged.
+- **Bigger kernels save about the same absolute time**, so less in
+  relative terms: −48% for `noop`, −26% to −41% for one-segment kernels,
+  and −21% to −23% for the 3-segment `lms` N=1 and `ed25519` N=3.
+- **`lms` N=3 is the exception, at −2%** (29:43 against 30:11): its
+  wrap overhead barely moved (+694 s → +666 s). This row spends ~19
+  minutes proving its own 9 segments, the longest stretch under the
+  outside load, while its overhead is computed against the idle-host
+  local prove. One run cannot separate a slower kernel proof from a
+  smaller saving; it needs a re-run on an idle host before reading
+  anything into it.
+- **The wrapper is still ~3–4× rc3's** (~75–105 s per TX).
+- **LMS W=1 costs about what ECDSA does end to end as well**: 7:53 at
+  N=1 (`ecdsa-secp256k1` 8:06) and 11:29 at N=3 (9:29). XMSS takes
+  17:22 and 42:28. At N=3 its 12.0M-cycle kernel is over the public
+  10M gas cap, but it runs as a private TX.
 
-| scheme | N=3 E2E |
-|---|---:|
-| `ecdsa-p256` | **4:58** (cheapest) |
-| `schnorr-secp256k1` | 5:22 |
-| `ecdsa-secp256k1` | 7:26 |
-| `ed25519` | 11:09 |
+<details>
+<summary>Previous E2E numbers at <code>dcbd318f0</code> (median of 3 runs, with ranges)</summary>
 
-For interactive UX (sub-30 s) **no scheme fits on CPU**. CUDA / Bonsai
-would compress this; CPU alone is too heavy.
+Measured against a fresh standalone LEZ `dev` sequencer at `dcbd318f0`
+on the same machine, three runs per row. (Run 1 used one sequencer home
+and private account; runs 2 and 3 a fresh pair, because the standalone
+sequencer's in-memory mock Bedrock does not survive a restart.)
+
+| scheme | N | E2E private TX (median) | range | local prove (median) | wrap overhead | v0.2.0-rc3 E2E |
+|---|---:|---:|---:|---:|---:|---:|
+| `noop` | 1 | 610.1 s (~10:10) | 587.6–620.9 s | 4.3 s | +606 s | 103.5 s (~1:43) |
+| `ecdsa-secp256k1` | 1 | 711.1 s (~11:51) | 702.0–778.5 s | 137.5 s | +574 s | 246.5 s (~4:06) |
+| `ecdsa-secp256k1` | 3 | 774.5 s (~12:54) | 773.4–817.8 s | 207.6 s | +567 s | 446.1 s (~7:26) |
+| `schnorr-secp256k1` | 1 | 646.4 s (~10:46) | 644.9–673.3 s | 66.1 s | +580 s | 153.7 s (~2:34) |
+| `schnorr-secp256k1` | 3 | 739.0 s (~12:19) | 711.5–768.2 s | 147.5 s | +592 s | 323.0 s (~5:23) |
+| `ed25519` | 1 | 740.6 s (~12:21) | 711.0–777.4 s | 138.8 s | +602 s | 283.0 s (~4:43) |
+| `ed25519` | 3 | 1047.2 s (~17:27) | 1016.7–1243.6 s | 390.4 s | +657 s | 669.7 s (~11:10) |
+| `ecdsa-p256` | 1 | 621.2 s (~10:21) | 614.0–653.1 s | 31.9 s | +589 s | 152.5 s (~2:33) |
+| `ecdsa-p256` | 3 | 717.1 s (~11:57) | 711.0–743.6 s | 130.8 s | +586 s | 298.8 s (~4:59) |
+| `lms` | 1 | 1014.0 s (~16:54) | 1007.3–1062.1 s | 398.6 s | +615 s | — |
+| `lms` | 3 | 1811.2 s (~30:11) | 1792.5–1868.1 s | 1116.8 s | +694 s | — |
+
+At `dcbd318` the wrapper dominated, at ~570–610 s per TX, up from
+~75–105 s on v0.2.0-rc3. It grew only a little with the kernel's
+segment count (+615 s and +657 s for the 3-segment `lms` N=1 and
+`ed25519` N=3, +694 s for the 9-segment `lms` N=3), as each kernel
+segment is lifted and joined into the succinct receipt. Run 1 alone
+put `ed25519` N=3 at 1243.6 s (+861 s); runs 2 and 3 did not repeat it.
+
+</details>
+
+#### Comparison with LEZ's own benchmarks
+
+LEZ publishes prover numbers in
+[`docs/benchmarks/cycle_bench.md`](https://github.com/logos-blockchain/logos-execution-zone/blob/dcbd318f0f2ef601fc93e67e0dabc49895d811ef/docs/benchmarks/cycle_bench.md),
+but they were measured on 2026-10-06 (Apple M2 Pro, CPU only, risc0
+3.0.5), before the actor model (#935, merged 2026-10-14) and the proven
+fee (#1125). Running LEZ's own harness, unmodified, at `dcbd318f0` on
+this laptop (not re-run at `98c3f9e`) (`cargo run --release -p cycle_bench --features ppe -- --ppe`):
+
+| `cycle_bench --ppe` case | this laptop, `dev` | LEZ docs (M2 Pro, pre-actor) |
+|---|---:|---:|
+| native Transfer in PPE, 0 dummy inputs | 242.5 s | 18.0 s |
+| native Transfer in PPE, 6 dummy inputs (wallet padding) | **228.5 s** | 25.3 s (7 dummies) |
+| scripted actor → native Transfer, depth 1 / 3 | 262.4 / 253.2 s | — |
+| scripted actor → native Transfer, depth 5 / 9 | 295.9 / 317.2 s | — |
+| proof size | 223 047 B | 223 047 B |
+
+(The published depth sweep used a `chain_caller` program that `dev`
+replaced with `scripted`, so those rows are not comparable. The
+depth-5 case spanned a laptop suspend; Rust's `Instant` excludes
+suspended time.)
+
+- **Inner proving matches LEZ's docs** after the hardware difference:
+  both show prove time following the padded segment size, at ~73 µs
+  per padded cycle there vs ~120–140 µs here (~1.8×).
+- **The privacy circuit does not.** A bare private native transfer
+  costs ~230–260 s here, where the published numbers predict ~45–80 s
+  on this laptop. So on `dev` the privacy circuit itself is roughly
+  **5× costlier** than LEZ's docs show; this reproduces with LEZ's own
+  harness, independent of our guests and wallet path.
+- **At `dcbd318`, our E2E wrapper (~600 s) was ~350 s above LEZ's
+  harness.** Our path adds a call into a *deployed* program (its
+  receipt is compressed and verified inside the circuit), the fee
+  proven in-circuit, and the wallet's RPC calls. `cycle_bench --ppe`
+  builds its input with `fee: None`, and erhant's profile put most of
+  the gap on the fee's two extra encapsulations, which `98c3f9e`
+  removes: the wrapper is now ~310–360 s.
+
+Consequences:
+
+- **The scheme still matters less end-to-end than in local proving.**
+  At `98c3f9e`, `ecdsa-p256` N=1 is ~49 s slower than `noop`, and the
+  spread across EC schemes at N=1 is 6:05 → 8:06 (10:21 → 12:21 at
+  `dcbd318`, 2:33 → 4:43 on rc3).
+- At N=3 the ranking is unchanged: `ecdsa-p256` < `schnorr-secp256k1`
+  < `ecdsa-secp256k1` < `ed25519` < `lms`. At N=1, `ed25519` and
+  `ecdsa-secp256k1` now tie (8:03 against 8:06, one run). `lms-w1` sits
+  with ECDSA; `xmss` is last.
+- The rc3 E2E rows were captured with pre-optimization binaries (before
+  [Pass 3](#optimization-passes)), so the rc3 → `dev` ratio slightly
+  understates the slowdown.
+
+Net for the headline RedStone shape — **3-of-N pull, end-to-end** —
+and for a DIA-style single signed intent:
+
+| scheme | N=3 E2E | N=1 E2E | at `dcbd318` (N=3 / N=1) |
+|---|---:|---:|---:|
+| `ecdsa-p256` | **7:52** (cheapest) | 6:05 | 11:57 / 10:21 |
+| `schnorr-secp256k1` | 7:57 | 6:30 | 12:19 / 10:46 |
+| `ecdsa-secp256k1` | 9:29 | 8:06 (DIA) | 12:54 / 11:51 |
+| `lms-w1` | 11:29 | 7:53 | — |
+| `ed25519` | 13:22 | 8:03 | 17:27 / 12:21 |
+| `lms` | 29:43 | 13:22 | 30:11 / 16:54 |
+| `xmss` | 42:28 | 17:22 | — |
+
+For interactive UX (sub-30 s) **nothing fits on CPU**: even a
+no-crypto private TX takes ~5 minutes here (~10 at `dcbd318`). CUDA /
+Bonsai, or a cheaper privacy circuit, is still the lever, not the
+signature scheme.
 
 ### Public execution (no proof)
 
-A public LEZ transaction is not proven. At v0.2.0-rc3 the sequencer
-runs the program in the RISC Zero executor (`nssa::Program::execute` →
-`default_executor().execute`, through `r0vm` as the sequencer image
-ships it), with a hard cap of 32M user cycles per execution
-(`MAX_NUM_CYCLES_PUBLIC_EXECUTION`; rc3 has no fees). `bench --public`
-makes the same call with the same cap and the same NSSA input framing.
-Cycles are deterministic; exec time is the median of 5 runs. Run on
-2026-11-24 on the same laptop with risc0-zkvm 3.0.5 and r0vm 3.0.5. The
-host was busy (load average ~7 of 16 threads, from outside the bench),
-so read exec times as indicative.
+A public LEZ transaction is not proven. On `dev` the sequencer runs the
+program in the RISC Zero executor (`lee`'s `Program::handle_message` →
+`execute_session`), with the session limit set to the gas limit the
+transaction declares. Execution gas is user cycles. Static fee validity
+rejects a gas limit above `MAX_GAS_EXEC` = 10M, which is also the cap on
+a whole block's execution gas (the fee market targets 5M per block). A
+run that hits its limit reverts as out of gas, and the fee is still
+charged. Storage gas is charged separately on the transaction's borsh
+size.
 
-| scheme | N | user cycles | noop guest, same fixture | segments | exec time | range (5 runs) | share of 32M cap |
+`bench --public` makes the same executor call, with the same framed
+`ReceiveInput` and a 10M session limit. A row that hits the limit is
+re-run without one, so the table still shows what the verification
+needs, and is marked **over cap**. Cycles are deterministic; exec time
+is the median of 5 runs. Run on 2026-11-24 on the same laptop with
+risc0-zkvm 3.1.0 through `r0vm` 3.1.0. The sequencer image instead
+links the executor in-process with a cached memory image (its `prove`
+feature), so it skips the `r0vm` start-up that dominates the `noop`
+row; the cycles are the same. The host was busy (load average 11–14 of
+16 threads, from outside the bench), so read exec times as indicative.
+
+| scheme | N | user cycles (= exec gas) | noop guest, same fixture | segments | exec time | range (5 runs) | share of 10M gas cap |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `noop` | 1 | 38 636 | — | 1 | 23 ms | 23–30 ms | 0.1% |
-| `ecdsa-secp256k1` | 1 | 342 537 | 38 636 | 1 | 37 ms | 36–38 ms | 1.0% |
-| `ecdsa-secp256k1` | 3 | 989 668 | 93 163 | 2 | 57 ms | 53–57 ms | 2.9% |
-| `schnorr-secp256k1` | 1 | 310 053 | 38 372 | 1 | 33 ms | 33–34 ms | 0.9% |
-| `schnorr-secp256k1` | 3 | 906 312 | 92 384 | 1 | 49 ms | 48–50 ms | 2.7% |
-| `ed25519` | 1 | 841 370 | 38 372 | 1 | 46 ms | 44–48 ms | 2.5% |
-| `ed25519` | 3 | 2 500 221 | 92 384 | 3 | 74 ms | 72–78 ms | 7.5% |
-| `ecdsa-p256` | 1 | 236 769 | 38 636 | 1 | 33 ms | 33–34 ms | 0.7% |
-| `ecdsa-p256` | 3 | 677 017 | 93 163 | 1 | 47 ms | 46–49 ms | 2.0% |
-| `lms` | 1 | 3 029 047 | 383 567 | 4 | 71 ms | 69–72 ms | 9.0% |
-| `lms` | 3 | 9 227 435 | 1 127 815 | 10 | 163 ms | 162–165 ms | 27.5% |
-| `lms-w1` | 1 | 2 686 482 | 2 408 513 | 3 | 75 ms | 74–75 ms | 8.0% |
-| `lms-w1` | 3 | 8 042 960 | 7 202 653 | 9 | 196 ms | 187–198 ms | 24.0% |
-| `xmss` | 1 | 4 650 652 | 715 453 | 5 | 113 ms | 111–118 ms | 13.9% |
-| `xmss` | 3 | 14 023 941 | 2 123 978 | 15 | 256 ms | 247–267 ms | 41.8% |
+| `noop` | 1 | 7 201 | — | 1 | 22 ms | 21–25 ms | 0.1% |
+| `ecdsa-secp256k1` | 1 | 311 082 | 7 201 | 1 | 38 ms | 37–39 ms | 3.1% |
+| `ecdsa-secp256k1` | 3 | 905 444 | 8 959 | 1 | 53 ms | 52–55 ms | 9.1% |
+| `schnorr-secp256k1` | 1 | 278 821 | 7 160 | 1 | 33 ms | 32–35 ms | 2.8% |
+| `schnorr-secp256k1` | 3 | 822 978 | 9 070 | 1 | 48 ms | 47–53 ms | 8.2% |
+| `ed25519` | 1 | 825 288 | 7 160 | 1 | 47 ms | 44–49 ms | 8.3% |
+| `ed25519` | 3 | 2 462 279 | 9 070 | 3 | 74 ms | 72–80 ms | 24.6% |
+| `ecdsa-p256` | 1 | 205 310 | 7 201 | 1 | 32 ms | 32–34 ms | 2.1% |
+| `ecdsa-p256` | 3 | 592 783 | 8 959 | 1 | 46 ms | 45–47 ms | 5.9% |
+| `lms` | 1 | 2 659 761 | 14 301 | 3 | 60 ms | 57–62 ms | 26.6% |
+| `lms` | 3 | 8 130 131 | 30 531 | 9 | 154 ms | 147–158 ms | 81.3% |
+| `lms-w1` | 1 | 334 205 | 56 256 | 1 | 31 ms | 30–32 ms | 3.3% |
+| `lms-w1` | 3 | 996 806 | 156 519 | 2 | 47 ms | 45–48 ms | 10.0% |
+| `xmss` | 1 | 3 962 149 | 21 179 | 5 | 102 ms | 101–106 ms | 39.6% |
+| `xmss` | 3 | 11 968 638 | 51 169 | 13 | 216 ms | 211–228 ms | 119.7% **over cap** |
 
-The "noop guest, same fixture" column runs the verify-free `noop` guest
-on that row's keys and signatures
+The cycle counts match the prove-mode table above row for row, so
+execute and prove count alike. The "noop guest, same fixture" column
+runs the verify-free `noop` guest on that row's keys and signatures
 (`bench --scheme noop --noop-fixture <scheme> --n <N> --public`), so it
-is the NSSA wrapper's cost for that input. The rest is verification.
+is the entrypoint's cost for that input. The rest is verification.
 
-| scheme | signature | verify / sig (N=1) | verify / sig (N=3 − N=1, ÷2) | input handling / sig | ≈ max N under the cap |
+| scheme | signature | verify / sig (N=1) | verify / sig (N=3 − N=1, ÷2) | input handling / sig | ≈ max N under 10M |
 |---|---:|---:|---:|---:|---:|
-| `ecdsa-p256` | 64 B | 198 133 | 192 860 | 27 264 | 152 |
-| `schnorr-secp256k1` | 64 B | 271 681 | 271 124 | 27 006 | 112 |
-| `ecdsa-secp256k1` | 64 B | 303 901 | 296 302 | 27 264 | 103 |
-| `ed25519` | 64 B | 802 998 | 802 420 | 27 006 | 40 |
-| `lms-w1` | 8 688 B | 277 969 | 281 169 | 2 397 070 | 12 |
-| `lms` | 1 296 B | 2 645 480 | 2 727 070 | 372 124 | 10 |
-| `xmss` | 2 500 B | 3 935 199 | 3 982 382 | 704 262 | 7 |
+| `ecdsa-p256` | 64 B | 198 109 | 192 858 | 879 | 51 |
+| `schnorr-secp256k1` | 64 B | 271 661 | 271 124 | 955 | 36 |
+| `ecdsa-secp256k1` | 64 B | 303 881 | 296 302 | 879 | 33 |
+| `lms-w1` | 8 688 B | 277 949 | 281 169 | 50 132 | 30 |
+| `ed25519` | 64 B | 818 128 | 817 540 | 955 | 12 |
+| `lms` | 1 296 B | 2 645 460 | 2 727 070 | 8 115 | 3 |
+| `xmss` | 2 500 B | 3 940 970 | 3 988 250 | 14 995 | 2 |
 
 "Max N" extrapolates linearly from N=1 and N=3; the fixtures only go
 to N=3.
 
-- **Public execution is cheap at every N measured: 23–260 ms per
-  call**, against minutes for a private TX. The `noop` floor (~23 ms)
-  is mostly `r0vm` start-up and the IPC round trip. The heaviest row,
-  `xmss` N=3, uses 42% of the cap.
-- **The NSSA wrapper costs ~274 user cycles per input byte.** rc3
-  encodes the instruction with RISC Zero serde (one u32 word per byte);
-  the guest decodes it and echoes the raw instruction data into
-  `ProgramOutput`. For 64-byte curve signatures that is noise (~27K
-  cycles per signer); for hash-based signatures it is not.
-- **LMS W=1 verifies as cheaply as ECDSA, but its signature costs
-  more than the verify saves.** W=1 has 265 hash chains of one step
-  where W=8 has 34 chains of up to 255 steps, so verification alone
-  drops ~10× to ~280K cycles per signature, about what ECDSA secp256k1
-  costs. Its 8 688-byte signature adds ~2.4M cycles
-  of input handling, so `lms-w1` lands within 11% of `lms` (W=8,
-  1 296 B). On this wrapper, the smaller hash-based signature wins.
-- **XMSS (h=10) costs ~1.5× LMS (h=5, W=8) per signature**: ~3.96M
-  cycles of verification plus ~0.70M of input handling for a 2 500-byte
-  signature. In exchange, each key signs 1 024 messages instead of 32.
-- **LMS cycles differ from the prove-mode table above**: 3 029 047 at
-  N=1 here vs 2 720 550 there (+11%). A dev-mode prove of this build
-  reports the same 3 029 047, so execute and prove count alike, and
-  the LMS fixture is byte-identical (a test pins it). The gap is
-  between this guest build and the one behind that table; the curve
-  rows reproduce within 0.3%.
+- **The 10M gas cap is now the binding limit, and it applies per
+  block.** `xmss` N=3 needs 12.0M cycles and would revert out of gas.
+  `lms` N=3 uses 81% of the cap. One transaction near the cap fills a
+  whole block, at twice the fee market's 5M target. Multi-signer
+  hash-based verification at W=8 or XMSS therefore crowds out
+  everything else in that block. ECDSA and Schnorr stay under 10% of
+  the cap at N=3.
+- **Input handling is close to free: ~6 user cycles per input byte.**
+  The actor entrypoint borsh-decodes the message and does not echo it,
+  where rc3's NSSA wrapper cost ~274 cycles per byte (see below).
+  A 64-byte curve signer costs under 1K cycles to read; an 8.7 KB LMS
+  W=1 signer costs ~50K.
+- **LMS W=1 is now the cheapest post-quantum row by far**: 334K cycles
+  at N=1, within 8% of ECDSA secp256k1 (311K), 8× below LMS W=8 and
+  12× below XMSS, and about 30 signers fit under the cap. W=1 has 265
+  hash chains of one step where W=8 has 34 chains of up to 255 steps.
+  The cost moves into bytes: the 8 688-byte signature is 6.7× W=8's,
+  and every byte is charged as storage gas. Each key signs 32 messages
+  at H=5, the same as W=8.
+- **XMSS (h=10) costs ~1.5× LMS W=8 per signature** (~3.94M cycles).
+  In exchange each key signs 1 024 messages instead of 32.
+- **Public execution takes 22–216 ms per call** at every N measured,
+  against minutes for a private TX.
+
+#### Public execution: LEZ v0.2.0-rc3 → `dev`
+
+The rc3 side is the same bench on `main` (risc0-zkvm and `r0vm` 3.0.5,
+under rc3's flat 32M-cycle `MAX_NUM_CYCLES_PUBLIC_EXECUTION`, no fees),
+run the same day on the same fixtures:
+
+| scheme | N | user cycles (rc3 → dev) | Δ | noop guest, same fixture (rc3 → dev) | ≈ max N (rc3 at 32M → dev at 10M) |
+|---|---:|---:|---:|---:|---:|
+| `noop` | 1 | 38 636 → 7 201 | -81% | — | — |
+| `ecdsa-secp256k1` | 1 | 342 537 → 311 082 | -9% | 38 636 → 7 201 | 103 → 33 |
+| `ecdsa-secp256k1` | 3 | 989 668 → 905 444 | -9% | 93 163 → 8 959 | |
+| `schnorr-secp256k1` | 1 | 310 053 → 278 821 | -10% | 38 372 → 7 160 | 112 → 36 |
+| `schnorr-secp256k1` | 3 | 906 312 → 822 978 | -9% | 92 384 → 9 070 | |
+| `ed25519` | 1 | 841 370 → 825 288 | -2% | 38 372 → 7 160 | 40 → 12 |
+| `ed25519` | 3 | 2 500 221 → 2 462 279 | -2% | 92 384 → 9 070 | |
+| `ecdsa-p256` | 1 | 236 769 → 205 310 | -13% | 38 636 → 7 201 | 152 → 51 |
+| `ecdsa-p256` | 3 | 677 017 → 592 783 | -12% | 93 163 → 8 959 | |
+| `lms` | 1 | 3 029 047 → 2 659 761 | -12% | 383 567 → 14 301 | 10 → 3 |
+| `lms` | 3 | 9 227 435 → 8 130 131 | -12% | 1 127 815 → 30 531 | |
+| `lms-w1` | 1 | 2 686 482 → 334 205 | **-88%** | 2 408 513 → 56 256 | **12 → 30** |
+| `lms-w1` | 3 | 8 042 960 → 996 806 | **-88%** | 7 202 653 → 156 519 | |
+| `xmss` | 1 | 4 650 652 → 3 962 149 | -15% | 715 453 → 21 179 | 7 → 2 |
+| `xmss` | 3 | 14 023 941 → 11 968 638 | -15% | 2 123 978 → 51 169 | |
+
+- **The whole change is input handling.** Verification per signature
+  is the same on both sides within 0.2% (`ed25519` +1.9%, from
+  `ed25519-dalek` 2.1.1 → 2.2.0). What fell is the entrypoint's cost
+  of reading the input. rc3 encoded the instruction with RISC Zero
+  serde (one u32 word per byte) and echoed it back into
+  `ProgramOutput`; `dev` reads one borsh frame.
+- **LMS W=1 flips from "no better than W=8" to the best hash-based
+  option.** On rc3 its 8.7 KB signature cost ~2.4M cycles to read, which
+  erased the 10× cheaper verify. On `dev` that is ~50K.
+- **Every other scheme fits fewer signers per transaction** because the
+  cap fell 3.4× (32M → 10M), and that cap is now shared by a whole
+  block.
+- The rc3 LMS row (3 029 047) is from the guest build behind the rc3
+  public results, not the 2 720 550 of the rc3 prove-mode comparison
+  above. Verify per signature is 2 645 480 on rc3 and 2 645 460 on
+  `dev`, so the difference is in that build's input handling.
 
 ## Methodology
 
-Each local-prove row is one **real prove pass** through
-`risc0_zkvm::default_prover()` with `RISC0_DEV_MODE=0`, against the
-NSSA-wrapped guest binary for that scheme. Inputs are written in the
-exact shape `nssa_core::read_nssa_inputs` expects (`self_program_id`,
-`caller_program_id`, `pre_states`, NSSA-encoded instruction). Cycles
-and segment count come from `ProveInfo.stats`; prove time is wall-clock
-around the `prove(...)` call; receipt size is
+Each local-prove row is a **real prove** through
+`risc0_zkvm::default_prover()` (r0vm 3.1.0) with `RISC0_DEV_MODE=0`,
+against the actor-model guest binary for that scheme. The guest's stdin
+is exactly what the LEZ engine writes for a root call: a 4-byte
+little-endian length followed by the borsh-encoded `ReceiveInput`
+(`from: None`, not authorized, empty pre-state, the borsh `VerifyInput`
+as `message`), built by `lez_signature_bench::guest_input_frame`.
+Cycles and segment count come from `ProveInfo.stats`; prove time is
+wall-clock around the `prove(...)` call; receipt size is
 `bincode::serialize(&receipt).len()`.
 
 Each E2E row submits a real privacy-preserving transaction via
-`wallet::WalletCore::send_privacy_preserving_tx()` against a running
-`lgs localnet` (sequencer in `risc0_dev_mode=true`, client in
-`RISC0_DEV_MODE=0`). The wall clock wraps `send_privacy_preserving_tx`,
-so it includes serialization, client-side proving (kernel +
-privacy-preserving wrapping circuit), the sequencer roundtrip, and
-confirmation.
+`wallet::WalletCore::send_privacy_preserving_tx()` against a local
+standalone LEZ `dev` sequencer (see [Run the bench](#run-the-bench)).
+Before the timed rows, each guest is deployed once through the program
+loader, paid by `--payer`; deploys are not timed. The wall clock wraps
+`send_privacy_preserving_tx` only, so it includes serialization,
+client-side proving (kernel + privacy-preserving circuit, compressed
+to a succinct receipt), the sequencer roundtrip, and confirmation. On
+`dev` every transaction pays a fee; with no public fee payer the wallet
+pays it inside the proof from the funded private account.
 
 Synthetic fixtures only — no captured oracle payloads. All signers
 share the same message (`b"hello redstone"`) per row, signed with
 deterministic seeds.
 
+### Run-to-run variance
+
+Each matrix (local and E2E) was run three times: run 1 on 2026-11-20
+(not monitored), run 2 on 2026-11-21 (local in the afternoon, E2E
+overnight) and run 3 on 2026-11-22 (overnight, back to back). Runs 2 and
+3 logged every 10 s: host-wide CPU use (`/proc/stat`) against the
+container's own (its cgroup `cpu.stat`), which gives the load from
+everything else on the host; swap traffic (`/proc/vmstat`); and core
+clocks with `k10temp` Tctl. Cycle counts and receipt sizes were
+identical in all three runs.
+
+| | run 1 local | run 1 E2E | run 2 local | run 2 E2E | run 3 local | run 3 E2E |
+|---|---:|---:|---:|---:|---:|---:|
+| other host load, mean (cores of 16) | — | — | 0.89 | 0.82 | 0.77 | 0.74 |
+| other host load, max | — | — | 2.17 | 9.29 | 1.46 | 1.35 |
+| 10 s samples above 1.5 cores | — | — | 14 | 26 | 0 | 0 |
+| all-core clock, mean | — | — | 3.69 GHz | 3.71 GHz | 3.73 GHz | 3.72 GHz |
+| Tctl, mean | — | — | 99.9 °C | 96.1 °C | 98.9 °C | 97.3 °C |
+| matrix total (timed rows only) | 2 656 s | 9 658 s | 2 946 s | 9 744 s | 2 768 s | 9 309 s |
+
+(Run 2's local clock covers only its second half, from when the clock
+logger started.)
+
+- **Host load does not explain the slow numbers.** Run 3 had a quiet
+  host throughout (never above 1.5 other cores, no suspend) and landed
+  between runs 1 and 2 on the local matrix and 4% below both on E2E.
+  The ~10 min private TX reproduces on an idle machine.
+- **The bursts that did happen line up with run 2's slow E2E rows:** a
+  compile on the host (up to 9.3 cores, 23:25–23:32) during
+  `ecdsa-secp256k1` N=1 (778.5 s vs 702.0 / 711.1 s), heavy swap-in
+  during `ecdsa-secp256k1` N=3 (817.8 s vs 773.4 / 774.5 s), and ~2.3
+  cores plus swap during `ecdsa-p256` N=1 (653.1 s vs 621.2 / 614.0 s).
+  Medians drop these.
+- **The CPU is thermally limited throughout.** Tctl averaged 96–100 °C
+  over every monitored matrix (≥ 99 °C for 83% of run 3's samples), with
+  all cores near 3.7 GHz. With the host quiet, how well the laptop sheds
+  heat is the most likely source of the remaining spread; it was not
+  tested.
+- **Unexplained outliers:** run 1's `ed25519` N=3 E2E (1243.6 s vs
+  1047.2 / 1016.7 s; not monitored), run 2's `lms` N=3 local (1242.1 s
+  vs 1055.6 / 1116.8 s, quiet host) and run 3's `ecdsa-secp256k1` N=1
+  local, which was *faster* (114.9 s vs 137.5 / 140.7 s).
+
+Spread is max − min over the median: 2–19% (median 9%) for local
+proves, 4–22% (median 6%) end to end.
+
+| scheme | N | local run 1 | run 2 | run 3 | spread | E2E run 1 | run 2 | run 3 | spread |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `noop` | 1 | 4.4 s | 4.3 s | 3.9 s | 12% | 610.1 s | 620.9 s | 587.6 s | 5% |
+| `ecdsa-secp256k1` | 1 | 137.5 s | 140.7 s | 114.9 s | 19% | 702.0 s | 778.5 s | 711.1 s | 11% |
+| `ecdsa-secp256k1` | 3 | 207.6 s | 211.4 s | 207.6 s | 2% | 773.4 s | 817.8 s | 774.5 s | 6% |
+| `schnorr-secp256k1` | 1 | 66.1 s | 68.4 s | 64.9 s | 5% | 644.9 s | 673.3 s | 646.4 s | 4% |
+| `schnorr-secp256k1` | 3 | 133.6 s | 157.1 s | 147.5 s | 16% | 768.2 s | 739.0 s | 711.5 s | 8% |
+| `ed25519` | 1 | 127.5 s | 139.4 s | 138.8 s | 9% | 777.4 s | 740.6 s | 711.0 s | 9% |
+| `ed25519` | 3 | 382.5 s | 416.2 s | 390.4 s | 9% | 1243.6 s | 1047.2 s | 1016.7 s | 22% |
+| `ecdsa-p256` | 1 | 31.7 s | 33.1 s | 31.9 s | 4% | 621.2 s | 653.1 s | 614.0 s | 6% |
+| `ecdsa-p256` | 3 | 127.8 s | 134.8 s | 130.8 s | 5% | 717.1 s | 743.6 s | 711.0 s | 5% |
+| `lms` | 1 | 381.7 s | 398.6 s | 420.6 s | 10% | 1007.3 s | 1062.1 s | 1014.0 s | 5% |
+| `lms` | 3 | 1055.6 s | 1242.1 s | 1116.8 s | 17% | 1792.5 s | 1868.1 s | 1811.2 s | 4% |
+
 ### Optimization passes
+
+*Measured on LEZ v0.2.0-rc3 / risc0 3.0.5, before the `dev` migration.
+The profile still applies.*
 
 The numbers above include a workspace-level tight `[profile.release]`
 applied to both host and guest (`lto = "fat"`, `codegen-units = 1`,
@@ -326,7 +696,7 @@ applied to both host and guest (`lto = "fat"`, `codegen-units = 1`,
 **Things tried that didn't ship:**
 
 - *Parallel segment proving.* `risc0_zkvm::default_prover()` in 3.0.5
-  loops segments sequentially (`local_prover/prover_impl.rs` line 89:
+  looped segments sequentially (`local_prover/prover_impl.rs` line 89:
   `for segment ... segments.push(prove_segment)`). Manual rayon
   parallelism would help N=3 cases but is a larger change than this
   pass; left as future work.
@@ -343,16 +713,30 @@ applied to both host and guest (`lto = "fat"`, `codegen-units = 1`,
   per-row bench numbers.
 - *GPU / Bonsai prove.* Out of scope per the user's review request.
 
-### Receipt-size note
+### Keccak coprocessor note
 
-`ecdsa-secp256k1`'s 492 KB local-prove receipt is roughly 1.8× any
-other scheme's receipt at the same segment count. This is the keccak
-coprocessor: `tiny-keccak`'s RISC0 patch routes each permutation
-through `risc0_keccak_update`, and the coprocessor's STARK proof is
-attached as a receipt assumption (~247 KB per keccak call vs ~24 KB
-for sha256-precompile use). The cost is mostly inherent to using
-keccak — switching to sha256 prehash would save the bytes but break
-Ethereum compatibility.
+`ecdsa-secp256k1` is the only scheme that hashes with keccak256, and
+`tiny-keccak`'s RISC0 patch routes each permutation through the keccak
+coprocessor. The coprocessor's permutations are proven in a **separate
+keccak STARK**, attached to the receipt as an assumption, so neither its
+size nor its prove time shows up in the main segment's cycle count:
+
+| | `schnorr-secp256k1` | `ecdsa-secp256k1` | Δ |
+|---|---:|---:|---:|
+| N=1 (both one 2^19 segment): receipt | 268 680 B | 491 815 B | +223 KB |
+| N=1: prove time, median (range) | 66.1 s (64.9–68.4) | 137.5 s (114.9–140.7) | **+71 s** (+50 to +72 per run) |
+| N=3 (both one 2^20 segment): receipt | 282 344 B | 505 483 B | +223 KB |
+
+At N=3 the `ecdsa-secp256k1` row (median 207.6 s) is ~60–75 s above
+the other single-2^20-segment rows (130.8–147.5 s). The digest is
+computed once per message, so one keccak proof covers all N signers.
+That ~50–75 s and ~223 KB are a fixed cost of using keccak at
+all; switching the prehash to sha256 would remove them but break
+Ethereum compatibility, which DIA and RedStone both need. The extra
+keccak work a real oracle verifier adds (EIP-712 struct hashing, or one
+package hash per RedStone signer) is a few more permutations; whether
+they still fit in one keccak proof was not measured. The privacy
+circuit itself also calls keccak (192 calls per private TX).
 
 ## Build
 
@@ -365,6 +749,14 @@ noop baseline; `lms` and `lms-w1` share one) for
 `riscv32im-risc0-zkvm-elf` and embeds them as
 `{ECDSA_SECP256K1,SCHNORR_SECP256K1,ED25519,ECDSA_P256,LMS,XMSS,NOOP}_ELF`.
 
+The `e2e` feature (on by default) pulls in the LEZ wallet and its whole
+dependency tree (rocksdb, keycard / `libpcsclite`, the Logos Blockchain
+circuits). For the local-prove bench alone:
+
+```bash
+cargo build --release --no-default-features
+```
+
 ## Run the bench
 
 ```bash
@@ -376,18 +768,14 @@ RISC0_DEV_MODE=0 cargo run --release --bin bench -- \
 RISC0_DEV_MODE=0 cargo run --release --bin bench -- --all
 
 # Public-execution matrix: execute without proving, as the sequencer
-# does for a public TX (needs an r0vm matching risc0-zkvm 3.0, e.g.
-# RISC0_SERVER_PATH=/path/to/r0vm-3.0.5)
-cargo run --release --bin bench -- --all --public --label public
+# does for a public TX, under the 10M-cycle MAX_GAS_EXEC cap
+cargo run --release --no-default-features --bin bench -- \
+  --all --public --label public
 # → results/results-public.json + results/README-snippet-public.md
 
-# End-to-end matrix against a running lgs localnet
-lgs localnet start
-lgs wallet -- account new private    # note the printed Private/<id>
-NSSA_WALLET_HOME_DIR="$PWD/.scaffold/wallet" RISC0_DEV_MODE=0 \
-  cargo run --release --bin bench -- \
-  --all --account-id Private/<your-id> --label e2e
-# → results/results-e2e.json + results/README-snippet-e2e.md
+# Noop guest on another scheme's fixture (input-handling cost alone)
+cargo run --release --no-default-features --bin bench -- \
+  --scheme noop --noop-fixture xmss --n 3 --public
 
 # Generate just the JSON fixture for one (scheme, N) point
 cargo run --release --bin gen_test_vectors -- \
@@ -397,33 +785,88 @@ cargo run --release --bin gen_test_vectors -- \
 `RISC0_DEV_MODE=1` skips actual proving and prints fake numbers.
 The bench logs a warning when this is set; never quote those numbers.
 
-The local matrix takes **~28 minutes** on the reference machine; the
-end-to-end matrix takes **~46 minutes** end-to-end (kernel + wrapping
-+ sequencer roundtrip per row).
+### End-to-end against a local LEZ sequencer
+
+`lgs` (logos-scaffold) pins older LEZ releases and has no actor-model
+support yet, so the E2E run uses a LEZ checkout at the same rev as this
+crate's pin, directly:
+
+```bash
+# In logos-execution-zone @ 98c3f9e (fresh sequencer and wallet homes:
+# the circuit image changed)
+cargo build --release -p sequencer_service --features sequencer_service/standalone -p wallet
+./target/release/sequencer_service setup "$SEQ_HOME" \
+  --config lez/sequencer/service/networks/local.json \
+  --funding-public-key 2e03b2eff5a45478e7e79668d2a146cf2c5c7925bce927f2b1c67f2ab4fc0d26 \
+  --create-channel
+RISC0_DEV_MODE=1 ./target/release/sequencer_service start "$SEQ_HOME"
+
+# Wallet (unencrypted storage), the two genesis-funded test accounts,
+# and a funded private account. The test accounts' keys are in LEZ's
+# Justfile (`wallet-import-test-accounts`); that recipe forces its own
+# wallet home, so import them by hand:
+export LEE_WALLET_HOME_DIR=$WALLET_HOME LEE_WALLET_PASSWORD=
+cp lez/wallet/configs/debug/wallet_config.json "$WALLET_HOME"/
+wallet check-health
+wallet account import public --private-key <test key 1 from LEZ's Justfile>
+wallet account import public --private-key <test key 2 from LEZ's Justfile>
+wallet account list                      # note a Private/<id>
+RISC0_DEV_MODE=1 wallet auth-transfer send \
+  --from Public/<test account 1> --to Private/<id> --amount 1000000000000
+
+# Back in this repo
+RISC0_DEV_MODE=0 cargo run --release --bin bench -- \
+  --all --account-id Private/<id> --payer Public/<test account 2> --label e2e
+# → results/results-e2e.json + results/README-snippet-e2e.md
+```
+
+> At `dcbd318f0` the standalone sequencer needed a one-line patch to
+> start on a fresh home: its mock Bedrock reported a channel tip slot
+> with no tip message, which the executor read as "channel configured
+> but holds no blocks" (`ChannelWithoutBlocks`,
+> logos-blockchain/logos-execution-zone#1138). `98c3f9e` includes the
+> fix (#1141), so no patch is needed.
+
+The local matrix takes **~45–50 minutes** on the reference machine. At
+`98c3f9e` the 15-row end-to-end matrix took **3 h 27 min** on a busy
+host, including seven untimed deploys. The timed transactions of the
+11 rows it shares with `dcbd318` sum to 1 h 56 min; that 11-row matrix
+took ~2 h 45–55 min end to end at `dcbd318`, deploys included.
 
 ## Lint and test
 
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace      # 12 host tests: byte-stable wire format
-                            # (ecdsa-k1, lms), positive + negative
-                            # round-trip per scheme
+cargo test --release --workspace
+#   17 host tests: byte-stable borsh wire format (ecdsa-k1, lms),
+#      positive + negative round-trip per scheme, LMS W=1 really is W=1
+#    3 guest tests (tests/guest_exec.rs): every guest ELF run in the
+#      RISC Zero executor with the engine's input frame — commits a
+#      keep-state Transition, rejects a corrupted signature
 ```
 
 CI (`.github/workflows/ci.yml`) runs the fmt + clippy + build set on
-every push and PR. Bench runs are local only.
+every push and PR, with `RISC0_SKIP_BUILD=1` (stub ELFs; the guest tests
+skip themselves). Bench runs are local only.
 
 ## Prerequisites
 
-- Rust toolchain 1.92.0 (auto-picked via `rust-toolchain.toml`).
-- The RISC Zero RISC-V guest toolchain. Install via
+- Rust toolchain 1.98.1 (auto-picked via `rust-toolchain.toml`; LEZ
+  `dev`'s pin).
+- The RISC Zero toolchain, at LEZ `dev`'s CI pins. Install via
   [`rzup`](https://dev.risczero.com/api/zkvm/install):
   ```bash
   curl -L https://risczero.com/install | bash
-  rzup install
+  rzup install rust 1.94.1
+  rzup install cpp 2024.1.5
+  rzup install r0vm 3.1.0
+  rzup install cargo-risczero 3.1.0
   ```
-- ~30 minutes of idle CPU time for a full matrix run.
+- For the `e2e` feature: a C/C++ toolchain, `libclang` (rocksdb
+  bindgen) and `libpcsclite` (keycard), e.g.
+  `dnf install gcc-c++ clang-devel pcsc-lite-devel`.
+- ~45 minutes of CPU for the local matrix; a few hours for E2E.
 
 ## Layout
 
@@ -434,19 +877,20 @@ every push and PR. Bench runs are local only.
 │   └── guest/
 │       ├── src/lib.rs                    # shared VerifyInput + per-scheme verifier modules
 │       └── src/bin/
-│           ├── ecdsa_secp256k1.rs        # NSSA-wrapped guest, one per scheme
+│           ├── ecdsa_secp256k1.rs        # actor-model guest, one per scheme
 │           ├── schnorr_secp256k1.rs
 │           ├── ed25519.rs
 │           ├── ecdsa_p256.rs
 │           ├── lms.rs                    # hash-based / post-quantum rows (W=8 and W=1)
 │           ├── xmss.rs                   # hash-based / post-quantum row
-│           └── noop.rs                   # NSSA-wrap-only calibration
+│           └── noop.rs                   # entrypoint-only calibration
 ├── src/
-│   ├── lib.rs                            # Scheme enum + host-side fixtures + verify_all
+│   ├── lib.rs                            # Scheme enum, fixtures, engine input frame, verify
 │   ├── verifier/                         # host-callable verify per scheme (mirrors guest)
 │   └── bin/
-│       ├── bench.rs                      # local-prove bench (single + --all)
+│       ├── bench.rs                      # local-prove, public-execution + E2E bench (single + --all)
 │       └── gen_test_vectors.rs           # write JSON fixture for one (scheme, N)
+├── tests/guest_exec.rs                   # guest ELFs in the executor
 ├── Cargo.toml                            # workspace + [patch.crates-io] for risc0 crypto forks
 ├── results/                              # gitignored — matrix output lives here
 ├── fixtures/                             # gitignored
@@ -467,7 +911,19 @@ Deliberately deferred (see [`SPEC.md`](./SPEC.md) §9):
   3-of-N cost meaningfully; out of the headline matrix.
 - **N-sweep** beyond {1, 3} for the winning scheme.
 - **Multi-machine numbers.** Cycles generalize; prove time doesn't.
-- **RedStone payload parsing.**
+- **Split the E2E wrapper** (~310–360 s per TX at `98c3f9e`, down from
+  ~600 s at `dcbd318`) into circuit, deployed-program composition and
+  compression. erhant profiled the circuit itself on
+  logos-blockchain/logos-execution-zone#1146: the payer note's one
+  remaining ML-KEM encapsulation is now 62% of it.
+- **Re-run E2E at `98c3f9e` on an idle host**, three times. The current
+  numbers are one run on a busy host, and `lms` N=3 needs checking.
+  Run `lms-w1` and `xmss` in the local-prove matrix too, and re-run E2E
+  once LEZ tags v0.4.
+- **RedStone payload parsing**, with per-signer messages (each RedStone
+  node signs its own package; our fixtures share one message).
+- **DIA EIP-712 verifier** on top of the `ecdsa-secp256k1` N=1 guest,
+  to measure whether the extra keccak calls stay in one keccak proof.
 
 ## License
 

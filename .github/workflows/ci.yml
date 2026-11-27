@@ -12,9 +12,6 @@ env:
   # target is provided by `rzup`, not stock rustup. methods/build.rs emits
   # a stub ELF. Guest correctness is verified locally via the bench binary.
   RISC0_SKIP_BUILD: "1"
-  # Pin: matches the VERSION baked into the upstream
-  # logos-blockchain rev (zk/circuits/utils/src/lib.rs EXPECTED_CIRCUITS_VERSION).
-  LOGOS_BLOCKCHAIN_CIRCUITS_VERSION: "v0.4.2"
 
 jobs:
   fmt:
@@ -24,8 +21,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain with rustfmt
         run: |
-          rustup toolchain install 1.92.0 --component rustfmt --profile minimal
-          rustup default 1.92.0
+          rustup toolchain install 1.98.1 --component rustfmt --profile minimal
+          rustup default 1.98.1
       - run: cargo fmt --all --check
 
   clippy:
@@ -35,30 +32,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain with clippy
         run: |
-          rustup toolchain install 1.92.0 --component clippy --profile minimal
-          rustup default 1.92.0
+          rustup toolchain install 1.98.1 --component clippy --profile minimal
+          rustup default 1.98.1
       - uses: Swatinem/rust-cache@v2
-      - name: Stage logos-blockchain-circuits
-        # The wallet/nssa dep tree pulls in logos-blockchain-pol, whose build
-        # script panics unless ~/.logos-blockchain-circuits exists with a
-        # matching VERSION. Fetch the matching release artifact.
-        run: |
-          set -euxo pipefail
-          mkdir -p "$HOME/.logos-blockchain-circuits"
-          # Find any release that ships the circuits artifact — the same
-          # tarball is attached to every logos-blockchain release.
-          # Write URLs to a file rather than `| head -n1` to avoid SIGPIPE
-          # (gh api is killed when head closes; under pipefail that's exit 141).
-          gh api repos/logos-blockchain/logos-blockchain/releases --paginate \
-            --jq ".[] | .assets[] | select(.name == \"logos-blockchain-circuits-${LOGOS_BLOCKCHAIN_CIRCUITS_VERSION}-linux-x86_64.tar.gz\") | .browser_download_url" \
-            > /tmp/urls.txt
-          asset_url="$(head -n1 /tmp/urls.txt)"
-          test -n "$asset_url"
-          curl -fLsS "$asset_url" -o /tmp/circuits.tar.gz
-          tar -C "$HOME/.logos-blockchain-circuits" --strip-components=1 -xzf /tmp/circuits.tar.gz
-          test -f "$HOME/.logos-blockchain-circuits/VERSION"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install system deps
+        # pcsc-lite: the LEZ wallet's keycard support links libpcsclite.
+        # libclang: rocksdb bindgen.
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libclang-dev
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   build:
@@ -68,23 +48,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain
         run: |
-          rustup toolchain install 1.92.0 --profile minimal
-          rustup default 1.92.0
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup default 1.98.1
       - uses: Swatinem/rust-cache@v2
-      - name: Stage logos-blockchain-circuits
-        run: |
-          set -euxo pipefail
-          mkdir -p "$HOME/.logos-blockchain-circuits"
-          # Write URLs to a file rather than `| head -n1` to avoid SIGPIPE
-          # (gh api is killed when head closes; under pipefail that's exit 141).
-          gh api repos/logos-blockchain/logos-blockchain/releases --paginate \
-            --jq ".[] | .assets[] | select(.name == \"logos-blockchain-circuits-${LOGOS_BLOCKCHAIN_CIRCUITS_VERSION}-linux-x86_64.tar.gz\") | .browser_download_url" \
-            > /tmp/urls.txt
-          asset_url="$(head -n1 /tmp/urls.txt)"
-          test -n "$asset_url"
-          curl -fLsS "$asset_url" -o /tmp/circuits.tar.gz
-          tar -C "$HOME/.logos-blockchain-circuits" --strip-components=1 -xzf /tmp/circuits.tar.gz
-          test -f "$HOME/.logos-blockchain-circuits/VERSION"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install system deps
+        # pcsc-lite: the LEZ wallet's keycard support links libpcsclite.
+        # libclang: rocksdb bindgen.
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev libclang-dev
       - run: cargo build --workspace

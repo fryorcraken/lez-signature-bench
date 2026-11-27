@@ -4,21 +4,23 @@
 //! function. Guest binaries are thin shells that call the matching one.
 //!
 //! Wire format mirrors the host crate's `lez_signature_bench::VerifyInput`.
+//! On LEZ `dev` (actor model) the message is borsh-encoded and delivered as
+//! `ReceiveInput::message`; `lee_core::actor_entrypoint!` decodes it.
 
 #![no_std]
 
 extern crate alloc;
 
 use alloc::vec::Vec;
-use serde::{Deserialize, Serialize};
+use borsh::{BorshDeserialize, BorshSerialize};
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug)]
 pub struct SignerVerification {
     pub pubkey: Vec<u8>,
     pub signature: Vec<u8>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(BorshSerialize, BorshDeserialize, Clone, Debug)]
 pub struct VerifyInput {
     pub message: Vec<u8>,
     pub signers: Vec<SignerVerification>,

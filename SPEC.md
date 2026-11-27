@@ -37,9 +37,16 @@ decision note are the primary artifacts.
 
 ## 2. Tech Stack
 
-- LEZ v0.2.0-rc3 (`nssa`, `nssa_core`, `wallet`, `common`)
-- `risc0-zkvm` 3.0.5
-- Rust toolchain pinned to 1.92.0 via `rust-toolchain.toml`
+- LEZ @ `98c3f9e` — `dev` @ `dcbd318f0` (the v0.4 actor model: `lee`,
+  `lee_core`, `program_loader_core`, `wallet`) plus the fee
+  optimizations of logos-execution-zone#1146. Local-prove and public
+  numbers were measured at `dcbd318f0`; guest cycle counts are
+  identical at both. Originally written against
+  v0.2.0-rc3 (`nssa`, `nssa_core`, `wallet`, `common`); see the README
+  for the migration and the before/after numbers.
+- `risc0-zkvm` 3.1.0 (was 3.0.5)
+- Rust toolchain pinned to 1.98.1 via `rust-toolchain.toml` (was 1.92.0;
+  LEZ `dev` pins 1.98.1)
 - Patched crypto (all RISC0-accelerated; verified in Phase 1 spike):
   - `k256 v0.13.4-risczero.1` (`risc0/RustCrypto-elliptic-curves`) —
     secp256k1 ECDSA **and** Schnorr. Schnorr's `verify_raw` calls
@@ -72,7 +79,7 @@ decision note are the primary artifacts.
 | `cargo run --release --bin gen_test_vectors -- --scheme <s> --n <n>` | Produce a deterministic synthetic fixture for one (scheme, N) point. |
 | `cargo run --release --bin bench -- --scheme <s> --n <n> --account-id <id>` | Run a single bench point as a real private TX; print cycles, prove_time, receipt_size, tx_e2e. |
 | `cargo run --release --bin bench -- --all --account-id <id>` | Run the full matrix; write `results/results.json` and a Markdown table snippet. |
-| `cargo run --release --bin bench -- --all --public` | Run the full matrix as public execution (executor only, no proof, 32M-cycle cap); print cycles and execution time. |
+| `cargo run --release --bin bench -- --all --public` | Run the full matrix as public execution (executor only, no proof, 10M-cycle `MAX_GAS_EXEC` cap); print cycles and execution time. |
 | `cargo test --workspace` | Host-side fixture round-trip + executor-mode guest sanity per scheme. |
 | `cargo fmt --all --check` | Format check (CI). |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Lint (CI). |
@@ -114,31 +121,20 @@ through cycles and (downstream) receipt size via segment count.
 Match the existing guest pattern. Each scheme binary is a thin shell:
 
 ```rust
-// methods/guest/src/bin/schnorr_secp256k1.rs
-use lez_signature_bench_guest::verifier::schnorr_k256;
-use nssa_core::program::{
-    AccountPostState, ProgramInput, ProgramOutput, read_nssa_inputs,
-};
+// methods/guest/src/bin/schnorr_secp256k1.rs (LEZ `dev` actor model)
+use lee_core::program::{ReceiveInput, Response};
+use lez_signature_bench_programs::{VerifyInput, verifier};
 
-fn main() {
-    let (
-        ProgramInput { self_program_id, caller_program_id, pre_states, instruction },
-        instruction_data,
-    ) = read_nssa_inputs::<lez_signature_bench::VerifyInput>();
+lee_core::actor_entrypoint!(handle_message);
 
-    schnorr_k256::verify_all(&instruction).expect("verify failed");
-
-    let post_states = pre_states
-        .iter()
-        .map(|a| AccountPostState::new(a.account.clone()))
-        .collect();
-    ProgramOutput::new(
-        self_program_id, caller_program_id, instruction_data,
-        pre_states, post_states,
-    )
-    .write();
+fn handle_message(_input: &ReceiveInput, message: VerifyInput) -> Response {
+    verifier::schnorr_k256::verify_all(&message).expect("verify failed");
+    Response::keep_state()
 }
 ```
+
+(On v0.2.0-rc3 the same shell used `read_nssa_inputs` / `ProgramOutput`
+and echoed every pre-state back as a post-state.)
 
 Per-scheme verifier modules expose a single
 `verify_all(&VerifyInput) -> Result<(), Error>` so binaries stay 10–15
@@ -172,13 +168,17 @@ No coverage target — this is a research bench, not a service.
 - Keep the AI-generated / not-for-mainnet warning at the top of
   `README.md`. This codebase is a research bench, not an audited
   primitive; the warning must be the first thing a reader sees.
-- NSSA-wrap every guest; bench numbers reflect real LEZ cost.
+- Wrap every guest in the LEZ program entrypoint (`actor_entrypoint!`
+  on `dev`; NSSA `read_nssa_inputs` on v0.2); bench numbers reflect
+  real LEZ cost.
 - Use RISC0 patched crypto for every scheme; flag any that fall back
   to soft crypto and exclude from the headline comparison.
 - Measure cycles + prove time + receipt size + end-to-end TX wall time
   for every (scheme, N) point.
 - Use deterministic fixtures (fixed seeds) so numbers reproduce.
-- Same message across all N signers (matches the oracle/RedStone shape).
+- Same message across all N signers. (Real RedStone payloads differ: each
+  node signs its own data package, so a RedStone verifier hashes N messages.
+  The per-signature verify cost is the same; see README "Oracle signing".)
 - When `RISC0_DEV_MODE=1` is used for a smoke run, output and any
   commit message referencing numbers must say so prominently. Dev-mode
   numbers are not real measurements.
@@ -188,7 +188,7 @@ No coverage target — this is a research bench, not a service.
 - GitHub repo rename (`lez-ecdsa` → `lez-signature-bench`) — visible to
   others, breaks links.
 - New crate dependencies beyond the four patched crypto crates.
-- Toolchain bump (currently 1.92.0).
+- Toolchain bump (currently 1.98.1).
 - Bumping `risc0-zkvm` major version.
 - Changes to LEZ devnet config.
 - Any push, deploy, or `gh repo *` command after the rename.
@@ -199,8 +199,8 @@ No coverage target — this is a research bench, not a service.
   comparison.
 - Commit fixtures, results JSON, devnet credentials, mnemonic seeds,
   or `.env` files.
-- Remove the no-op baseline — it's the calibration anchor for NSSA
-  overhead.
+- Remove the no-op baseline — it's the calibration anchor for the LEZ
+  entrypoint overhead.
 - Use threshold cryptography or batch verification in the headline
   matrix (note as future work; if measured, add as separate rows).
 - Bypass git hooks (`--no-verify`) or signing flags

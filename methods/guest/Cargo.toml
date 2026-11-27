@@ -6,8 +6,8 @@ license = { workspace = true }
 
 [dependencies]
 risc0-zkvm.workspace = true
-nssa_core.workspace = true
-serde.workspace = true
+lee_core.workspace = true
+borsh.workspace = true
 k256 = { workspace = true, features = ["arithmetic"] }
 p256 = { workspace = true, features = ["arithmetic"] }
 ed25519-dalek.workspace = true

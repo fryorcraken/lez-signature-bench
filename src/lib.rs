@@ -1,3 +1,8 @@
+use borsh::{BorshDeserialize, BorshSerialize};
+use lee_core::{
+    account::{AccountId, Actor, ActorState},
+    program::ReceiveInput,
+};
 use serde::{Deserialize, Serialize};
 use tiny_keccak::{Hasher, Keccak};
 
@@ -5,7 +10,8 @@ pub mod verifier;
 
 /// Signature schemes the bench compares.
 ///
-/// Wire format: every fixture serializes to `VerifyInput`, whose `signers`
+/// Wire format: every fixture borsh-serializes to `VerifyInput` (the actor
+/// message on LEZ `dev`), whose `signers`
 /// field is interpreted by the per-scheme guest binary picked at submission
 /// time. The `Scheme` enum is host-side only — it tells the host which
 /// guest ELF to embed and which signing path to use when building fixtures.
@@ -56,7 +62,7 @@ impl Scheme {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Clone, Debug)]
 pub struct SignerVerification {
     /// Scheme-specific pubkey encoding.
     pub pubkey: Vec<u8>,
@@ -64,7 +70,7 @@ pub struct SignerVerification {
     pub signature: Vec<u8>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, BorshSerialize, BorshDeserialize, Clone, Debug)]
 pub struct VerifyInput {
     pub message: Vec<u8>,
     pub signers: Vec<SignerVerification>,
@@ -127,6 +133,27 @@ pub fn make_test_vector(scheme: Scheme, num_signers: usize) -> VerifyInput {
     }
 }
 
+/// The `ReceiveInput` the LEZ engine hands an actor for a root call from the
+/// transaction itself: no sender, not authorized, empty pre-state, with the
+/// borsh-encoded `VerifyInput` as the message. The receiver addresses are
+/// arbitrary; the guests never read them.
+pub fn receive_input(input: &VerifyInput) -> ReceiveInput {
+    ReceiveInput {
+        receiver: Actor::new(AccountId::new([0x11; 32]), AccountId::new([0x22; 32])),
+        from: None,
+        is_authorized: false,
+        pre_state: ActorState::empty(),
+        message: borsh::to_vec(input).expect("borsh-encode VerifyInput"),
+    }
+}
+
+/// The guest's stdin for a local prove/execute: `receive_input` as a
+/// length-prefixed borsh frame, exactly what `lee_core::program::run_actor`
+/// reads.
+pub fn guest_input_frame(input: &VerifyInput) -> Vec<u8> {
+    lee_core::to_borsh_frame(&receive_input(input))
+}
+
 /// Host-callable verify, mirroring the per-scheme guest verifier.
 pub fn verify(scheme: Scheme, input: &VerifyInput) -> Result<(), String> {
     match scheme {
@@ -144,22 +171,23 @@ pub fn verify(scheme: Scheme, input: &VerifyInput) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// Captured wire-format (bincode) hex of `make_test_vector(EcdsaSecp256k1, 1)`
-    /// at the commit that introduced the Scheme enum. Locks the wire format so a
-    /// future refactor of the builder cannot silently change what the
-    /// guest sees on the wire.
-    const ECDSA_SECP256K1_N1_BINCODE_HEX: &str = "0e0000000000000068656c6c6f2072656473746f6e65010000000000000021000000000000000202e3c3d6475bd9820f1b6966a40950b4475dbf7c39bcfc38e7bf1eae4194c4c840000000000000003ad850b0ac28fda79d349cfa96204eb72161ebd102b89c6c523b60ecb6b5e96e0d87b364eab41d3f7a3aee55f5cefab80b0e36fee6502e9053b5dee8d5f99c07";
+    /// Wire-format (borsh) hex of `make_test_vector(EcdsaSecp256k1, 1)`: the
+    /// bytes the guest receives as `ReceiveInput::message`. Derived from the
+    /// bincode hex captured when the Scheme enum was introduced (same fields,
+    /// u32 instead of u64 length prefixes), so it also proves the fixture
+    /// itself did not change across the LEZ `dev` migration.
+    const ECDSA_SECP256K1_N1_BORSH_HEX: &str = "0e00000068656c6c6f2072656473746f6e6501000000210000000202e3c3d6475bd9820f1b6966a40950b4475dbf7c39bcfc38e7bf1eae4194c4c8400000003ad850b0ac28fda79d349cfa96204eb72161ebd102b89c6c523b60ecb6b5e96e0d87b364eab41d3f7a3aee55f5cefab80b0e36fee6502e9053b5dee8d5f99c07";
 
     /// LMS is deterministic (HSS keygen + signing are derived from the seed),
     /// so the wire format is locked too. Parameters: Sha256_256 / LmotsW8 / LmsH5.
-    const LMS_N1_BINCODE_HEX: &str = "0e0000000000000068656c6c6f2072656473746f6e6501000000000000003c0000000000000000000001000000050000000464fc3062a44336c0424777e1ec759825dcc7011b4aa871fc80efcadc3ded530ca76d788e14d6827df7a87a7d3d2695251005000000000000000000000000000000000004e33b70653ff6b7c174eac09797186038be7eb830ff069bfc3d2666c5c6adb2b95f2fa2e5fcb74b0b717fa8fa1ecd23b8c9b50d5bdc02f6f4eac11d367af523c06b6cad1fd053855cbbf5bde76c9ee7618b412b97c291101fc72d6d3a43414b0de4a702b9dd19ed251c5dafc5de18485f78a33b632edd81f3082ef260e2925121f1197890f30a7e32cd8d11be26ecaa662d181b91c0cc8602ea173a0158ee736b42a9eb7a0bead46d60cd6493ce167c2dcbf6c140d145f9eaba1afb31a2d025af11c4ede76af5564c8c25e6b6ad2307004ebdca193ef49c4b5cd6e9f3537bf39dcda3b79c015f9b6b88cc7fca94aac9e0fc2622053c136a5810e7a69887fdca9b0a8fba3fe270c107452e996db5c21a740bf9148e32805a079fde5b8bdc6fa237c63e6e2e2557fd93e473b9f9315b371bb6a95bef9e907dfab359fe065193bce38b0c93a93fe8a07bf9e01c9db7ef6f773205e929fbe52eda2c76baf082a2d2a09c9351e72091c11a79cdca61118ce9cd7e6d5a6e5f640f0847c9ea7ccbad994fefc1483deb5a005a9e4334e2dec0fc7789dccc260609b702d0d760f8dd748902c5ff160520370fd7cda7cf299a3c25b38f19393fac93b55ac411a520f251602987d8a77c8ea9096b0f86875aa57928a17206642b2ba551d4fcbfb374f35cf63b004968ef3620591f415ac587cd29bb96fcd224a5def7cd31a8948bffaad341b763e60af2576f08ddeef21ff4689e5dcf401c2fdafce7146b9807ca3a068a9f4f3447e092e63140cb19852420a528052457be4f7b5f7dd84e0776274c540658d7e46e61f45c1c5da3f79241d38bbd50a2ac82f0814a9d7eae8dee6c86fe8e5594ad6cc6209138ddfc742bdbfc74ccf00e1518b439bd88aca58ded9032404c3b1454e69dd3f3da8ea46e738bf936d673e5e0732cd04836498b3135aa9075c39417520d867eabb034672a038a0b6131abd823fda734ffd4c9308b26e84b3cb891949cc110e99354195db29df1662aae28e93b26872d6f95379f95a7acf926152761647eb798514d36fe57f40dcb1a2c41be7c527e4b6ccb180c83064e0470355673857fb792c69db6cf9137f6843763fe7d0a979b2c602b2256bb1729798cd6597e0d4402ab44d0e192bc68378bf331da6127ec7c7da839c02199495743dad3a7eff44b840bce32fb32c7fd1bfb983b844ca4c3c87833b4a39ce2fd925b70d547427f134425d9b8f5c7b1555732f181a99a579725c2f4d53ee4e8317d85f45b12246b98f02aa4cf6eec88ca52e2af269a5a64ca5762a1917bb82778233261d4b322f2f511bc97094b17c94ff645810f33467df60b9bfa84ae5f3e22864d9c66374f48ead83607d6acb3d84fa8d5ae0d90aa53cd1d2746a2cf6b59ba6a56c1ec98b0a9a7ce66df5142729ff30e543c03f93a6f7b096c505d7a15623860016d77e44e2a74bd26c983234cd3d95a22ac0e0ab8055a3bb688378b03d0bceaba1adc512cf45adc15574ff3d9e4ff5e0fb08bb96e6f8861fc5a220c64baa1c7f6c24dc918a0d621d5d44cc9f1b1963995aa01433d81eb82beda0f1dbcad63bed8eb4f9ad40000000531fc2c0b383a54536eabc1f53dfb429f80825b1ffbbd74c8d895fd90dcf1ccf2a8dff7e1df3d364ec2cb23d4644f6edc9b9ed1a2a35c509adc05df7162cd5e144e8bc43c0d92380fe0251e1948d30e8925196890bcd187902f566baef910ed4c9dbe17ae1476f49224a9a76a2e1fcd2c5cc26f5684cb911ebef331b576a0758068a2eaacc7ec8f1cf2556ed9bc13896a76ff817448d88e17af41326d30a326a9";
+    const LMS_N1_BORSH_HEX: &str = "0e00000068656c6c6f2072656473746f6e65010000003c00000000000001000000050000000464fc3062a44336c0424777e1ec759825dcc7011b4aa871fc80efcadc3ded530ca76d788e14d6827df7a87a7d3d26952510050000000000000000000000000004e33b70653ff6b7c174eac09797186038be7eb830ff069bfc3d2666c5c6adb2b95f2fa2e5fcb74b0b717fa8fa1ecd23b8c9b50d5bdc02f6f4eac11d367af523c06b6cad1fd053855cbbf5bde76c9ee7618b412b97c291101fc72d6d3a43414b0de4a702b9dd19ed251c5dafc5de18485f78a33b632edd81f3082ef260e2925121f1197890f30a7e32cd8d11be26ecaa662d181b91c0cc8602ea173a0158ee736b42a9eb7a0bead46d60cd6493ce167c2dcbf6c140d145f9eaba1afb31a2d025af11c4ede76af5564c8c25e6b6ad2307004ebdca193ef49c4b5cd6e9f3537bf39dcda3b79c015f9b6b88cc7fca94aac9e0fc2622053c136a5810e7a69887fdca9b0a8fba3fe270c107452e996db5c21a740bf9148e32805a079fde5b8bdc6fa237c63e6e2e2557fd93e473b9f9315b371bb6a95bef9e907dfab359fe065193bce38b0c93a93fe8a07bf9e01c9db7ef6f773205e929fbe52eda2c76baf082a2d2a09c9351e72091c11a79cdca61118ce9cd7e6d5a6e5f640f0847c9ea7ccbad994fefc1483deb5a005a9e4334e2dec0fc7789dccc260609b702d0d760f8dd748902c5ff160520370fd7cda7cf299a3c25b38f19393fac93b55ac411a520f251602987d8a77c8ea9096b0f86875aa57928a17206642b2ba551d4fcbfb374f35cf63b004968ef3620591f415ac587cd29bb96fcd224a5def7cd31a8948bffaad341b763e60af2576f08ddeef21ff4689e5dcf401c2fdafce7146b9807ca3a068a9f4f3447e092e63140cb19852420a528052457be4f7b5f7dd84e0776274c540658d7e46e61f45c1c5da3f79241d38bbd50a2ac82f0814a9d7eae8dee6c86fe8e5594ad6cc6209138ddfc742bdbfc74ccf00e1518b439bd88aca58ded9032404c3b1454e69dd3f3da8ea46e738bf936d673e5e0732cd04836498b3135aa9075c39417520d867eabb034672a038a0b6131abd823fda734ffd4c9308b26e84b3cb891949cc110e99354195db29df1662aae28e93b26872d6f95379f95a7acf926152761647eb798514d36fe57f40dcb1a2c41be7c527e4b6ccb180c83064e0470355673857fb792c69db6cf9137f6843763fe7d0a979b2c602b2256bb1729798cd6597e0d4402ab44d0e192bc68378bf331da6127ec7c7da839c02199495743dad3a7eff44b840bce32fb32c7fd1bfb983b844ca4c3c87833b4a39ce2fd925b70d547427f134425d9b8f5c7b1555732f181a99a579725c2f4d53ee4e8317d85f45b12246b98f02aa4cf6eec88ca52e2af269a5a64ca5762a1917bb82778233261d4b322f2f511bc97094b17c94ff645810f33467df60b9bfa84ae5f3e22864d9c66374f48ead83607d6acb3d84fa8d5ae0d90aa53cd1d2746a2cf6b59ba6a56c1ec98b0a9a7ce66df5142729ff30e543c03f93a6f7b096c505d7a15623860016d77e44e2a74bd26c983234cd3d95a22ac0e0ab8055a3bb688378b03d0bceaba1adc512cf45adc15574ff3d9e4ff5e0fb08bb96e6f8861fc5a220c64baa1c7f6c24dc918a0d621d5d44cc9f1b1963995aa01433d81eb82beda0f1dbcad63bed8eb4f9ad40000000531fc2c0b383a54536eabc1f53dfb429f80825b1ffbbd74c8d895fd90dcf1ccf2a8dff7e1df3d364ec2cb23d4644f6edc9b9ed1a2a35c509adc05df7162cd5e144e8bc43c0d92380fe0251e1948d30e8925196890bcd187902f566baef910ed4c9dbe17ae1476f49224a9a76a2e1fcd2c5cc26f5684cb911ebef331b576a0758068a2eaacc7ec8f1cf2556ed9bc13896a76ff817448d88e17af41326d30a326a9";
 
     #[test]
     fn make_test_vector_ecdsa_secp256k1_n1_is_byte_stable() {
         let v = make_test_vector(Scheme::EcdsaSecp256k1, 1);
-        let actual = hex::encode(bincode::serialize(&v).expect("bincode serialize"));
+        let actual = hex::encode(borsh::to_vec(&v).expect("borsh serialize"));
         assert_eq!(
-            actual, ECDSA_SECP256K1_N1_BINCODE_HEX,
+            actual, ECDSA_SECP256K1_N1_BORSH_HEX,
             "wire format for (ECDSA secp256k1, n=1) changed",
         );
     }
@@ -167,9 +195,9 @@ mod tests {
     #[test]
     fn make_test_vector_lms_n1_is_byte_stable() {
         let v = make_test_vector(Scheme::Lms, 1);
-        let actual = hex::encode(bincode::serialize(&v).expect("bincode serialize"));
+        let actual = hex::encode(borsh::to_vec(&v).expect("borsh serialize"));
         assert_eq!(
-            actual, LMS_N1_BINCODE_HEX,
+            actual, LMS_N1_BORSH_HEX,
             "wire format for (LMS, n=1) changed",
         );
     }

@@ -1,17 +1,28 @@
-//! Bench harness for signature schemes inside an NSSA-wrapped LEZ guest.
+//! Bench harness for signature schemes inside a LEZ actor-model guest.
+//!
+//! Targets LEZ `dev` (the v0.4 actor model): each guest is an
+//! `actor_entrypoint!` handler that receives one borsh-encoded `VerifyInput`
+//! message and returns `Response::keep_state()`.
 //!
 //! Three modes:
 //!
 //! * **Local prove** (default): proves locally via
-//!   `risc0_zkvm::default_prover()`. Records cycles, prove time, receipt size.
+//!   `risc0_zkvm::default_prover()`, feeding the guest the same borsh-framed
+//!   `ReceiveInput` the LEZ engine writes. Records cycles, prove time,
+//!   receipt size.
 //! * **Public execution** (`--public`): runs the guest in
 //!   `risc0_zkvm::default_executor()` without proving, which is what the
-//!   sequencer does for a public transaction (`nssa::Program::execute` at
-//!   v0.2.0-rc3), under the same 32M user-cycle cap. Records cycles and
-//!   execution time.
-//! * **End-to-end private TX** (`--account-id <id>`): submits a real
-//!   privacy-preserving transaction via `wallet::WalletCore::send_privacy_preserving_tx`
-//!   against a running localnet. Records wall-clock end-to-end time.
+//!   sequencer does for a public transaction on LEZ `dev` (`lee`'s
+//!   `Program::handle_message` → `execute_session`), with the same framed
+//!   input. The session limit is the
+//!   largest execution-gas limit a public transaction may declare
+//!   (`MAX_GAS_EXEC`, 10M user cycles). Records cycles and execution time.
+//! * **End-to-end private TX** (`--account-id <id> --payer <id>`, needs the
+//!   `e2e` feature): deploys each guest through the program loader (fee paid
+//!   by `--payer`), then submits a real privacy-preserving transaction via
+//!   `wallet::WalletCore::send_privacy_preserving_tx` against a running
+//!   sequencer. Records wall-clock end-to-end time of the transaction only
+//!   (the deploy is not timed).
 //!
 //! `--all` runs the full (scheme × N) matrix plus the noop calibration
 //! baseline. Output goes to `results/results.json` and
@@ -23,18 +34,16 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
-use lez_signature_bench::{Scheme, VerifyInput, make_test_vector};
+use lez_signature_bench::{Scheme, VerifyInput, guest_input_frame, make_test_vector};
 use lez_signature_bench_methods::{
     ECDSA_P256_ELF, ECDSA_SECP256K1_ELF, ED25519_ELF, LMS_ELF, NOOP_ELF, SCHNORR_SECP256K1_ELF,
     XMSS_ELF,
 };
-use nssa::{AccountId, program::Program};
 use risc0_zkvm::{ExecutorEnv, default_executor, default_prover};
 use serde::{Deserialize, Serialize};
-use wallet::{PrivacyPreservingAccount, WalletCore};
 
 #[derive(Parser, Debug)]
-#[command(about = "Bench across signature schemes inside an NSSA-wrapped LEZ guest.")]
+#[command(about = "Bench across signature schemes inside a LEZ actor-model guest.")]
 struct Cli {
     /// Scheme slug (ecdsa-secp256k1 | schnorr-secp256k1 | ed25519 | ecdsa-p256 | lms | lms-w1 | xmss | noop). Ignored with --all.
     #[arg(long)]
@@ -53,9 +62,13 @@ struct Cli {
     out_dir: PathBuf,
     /// PrivateOwned account id (e.g. `Private/...`) for end-to-end TX mode.
     /// When set, the bench submits real privacy-preserving TXs instead of
-    /// proving locally. Requires a running localnet and `WalletCore::from_env()`.
+    /// proving locally. Requires a running sequencer and `WalletCore::from_env()`.
     #[arg(long)]
     account_id: Option<String>,
+    /// Funded public account (e.g. `Public/...`) that pays the program-loader
+    /// deploy fees in end-to-end mode.
+    #[arg(long)]
+    payer: Option<String>,
     /// File suffix for output files in --all mode (e.g. "e2e" → results-e2e.json).
     #[arg(long)]
     label: Option<String>,
@@ -64,17 +77,18 @@ struct Cli {
     /// execution time instead of prove time.
     #[arg(long, conflicts_with = "account_id")]
     public: bool,
-    /// Fixture fed to the noop guest with `--scheme noop`. The noop guest
-    /// skips verification, so this isolates the NSSA wrapper's cost of
-    /// reading and echoing that scheme's keys and signatures.
+    /// With `--scheme noop`: the scheme whose fixture (keys and signatures)
+    /// the noop guest receives. The noop guest decodes the message but
+    /// skips verification, so this isolates the cost of reading that
+    /// scheme's keys and signatures.
     #[arg(long, default_value = "ecdsa-secp256k1")]
     noop_fixture: String,
 }
 
-/// `nssa::program::MAX_NUM_CYCLES_PUBLIC_EXECUTION` at v0.2.0-rc3: the
-/// sequencer's session limit for one public program execution. The
-/// executor counts it in user cycles.
-const MAX_NUM_CYCLES_PUBLIC_EXECUTION: u64 = 1024 * 1024 * 32;
+/// `fee_core::market::MAX_GAS_EXEC` on LEZ `dev`: the largest execution-gas
+/// limit a public transaction may declare (validity rejects more), which is
+/// also the per-block execution-gas cap. Execution gas is user cycles.
+const MAX_GAS_EXEC: u64 = 10_000_000;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum Mode {
@@ -97,6 +111,11 @@ struct Row {
     /// Execute-only wall-clock (Some only in public mode).
     #[serde(default)]
     exec_seconds: Option<f64>,
+    /// Public mode: the execution ran past `MAX_GAS_EXEC`, so the sequencer
+    /// would revert it out of gas. Cycles and time are then from a re-run
+    /// without the cap.
+    #[serde(default)]
+    over_gas_cap: Option<bool>,
     /// E2E private-TX wall-clock (Some only in E2E mode).
     tx_e2e_seconds: Option<f64>,
 }
@@ -107,31 +126,18 @@ fn elf_for(scheme: Scheme) -> &'static [u8] {
         Scheme::SchnorrSecp256k1 => SCHNORR_SECP256K1_ELF,
         Scheme::Ed25519 => ED25519_ELF,
         Scheme::EcdsaP256 => ECDSA_P256_ELF,
-        // hbs-lms reads the LM-OTS / LMS type codes from the signature, so
-        // the same guest verifies every LMS parameter set.
+        // One guest for both W values: the LM-OTS type code is in the signature.
         Scheme::Lms | Scheme::LmsW1 => LMS_ELF,
         Scheme::Xmss => XMSS_ELF,
     }
 }
 
-fn build_local_env<'a>(input: &'a VerifyInput, session_limit: Option<u64>) -> ExecutorEnv<'a> {
-    let self_program_id: [u32; 8] = [0; 8];
-    let caller_program_id: Option<[u32; 8]> = None;
-    let pre_states: Vec<nssa_core::account::AccountWithMetadata> = Vec::new();
-    let instruction_data: Vec<u32> = risc0_zkvm::serde::to_vec(input).expect("encode VerifyInput");
-
+fn build_local_env(input: &VerifyInput, session_limit: Option<u64>) -> ExecutorEnv<'static> {
     ExecutorEnv::builder()
-        .write(&self_program_id)
-        .unwrap()
-        .write(&caller_program_id)
-        .unwrap()
-        .write(&pre_states)
-        .unwrap()
-        .write(&instruction_data)
-        .unwrap()
+        .write_slice(&guest_input_frame(input))
         .session_limit(session_limit)
         .build()
-        .unwrap()
+        .expect("build ExecutorEnv")
 }
 
 fn run_local(label: &str, n: usize, elf: &'static [u8], input: &VerifyInput) -> Row {
@@ -153,78 +159,149 @@ fn run_local(label: &str, n: usize, elf: &'static [u8], input: &VerifyInput) -> 
         prove_seconds: Some(prove_seconds),
         receipt_bytes: Some(receipt_bytes),
         exec_seconds: None,
+        over_gas_cap: None,
         tx_e2e_seconds: None,
     }
 }
 
+/// Public execution: the executor alone, under the public-transaction gas
+/// cap. `SessionInfo::cycles()` is the user-cycle count, which is what the
+/// sequencer charges as execution gas; the padded total is the po2-rounded
+/// segment sum a prover would pay for. The executor reports no paging
+/// split and there is no receipt.
+///
+/// A run that hits the cap is what the sequencer reverts as out of gas.
+/// The row is then re-run without the cap, so it still reports what the
+/// verification would need, and is flagged `over_gas_cap`.
 fn run_public(label: &str, n: usize, elf: &'static [u8], input: &VerifyInput) -> Row {
-    let env = build_local_env(input, Some(MAX_NUM_CYCLES_PUBLIC_EXECUTION));
-    let t0 = Instant::now();
-    let session = default_executor().execute(env, elf).expect("execute");
-    let exec_seconds = t0.elapsed().as_secs_f64();
+    let execute = |limit| {
+        let env = build_local_env(input, limit);
+        let t0 = Instant::now();
+        default_executor()
+            .execute(env, elf)
+            .map(|session| (session, t0.elapsed().as_secs_f64()))
+    };
+    let (session, exec_seconds, over_gas_cap) = match execute(Some(MAX_GAS_EXEC)) {
+        Ok((session, secs)) => (session, secs, false),
+        // Same test as LEZ's `Program::execute_session`: the root cause of
+        // the executor's session-limit bail, not a guest panic message.
+        Err(e)
+            if e.root_cause()
+                .to_string()
+                .starts_with("Session limit exceeded") =>
+        {
+            let (session, secs) = execute(None).expect("execute without the gas cap");
+            (session, secs, true)
+        }
+        Err(e) => panic!("execute: {e:#}"),
+    };
     Row {
         scheme: label.to_string(),
         n,
-        // What a prover would pay: each segment padded to its po2.
         total_cycles: Some(session.segments.iter().map(|s| 1u64 << s.po2).sum()),
         user_cycles: Some(session.cycles()),
-        // The executor's SessionInfo does not report paging cycles.
         paging_cycles: None,
         segments: Some(session.segments.len()),
         prove_seconds: None,
         receipt_bytes: None,
         exec_seconds: Some(exec_seconds),
+        over_gas_cap: Some(over_gas_cap),
         tx_e2e_seconds: None,
     }
 }
 
-async fn run_e2e(
-    label: &str,
-    n: usize,
-    elf: &'static [u8],
-    input: &VerifyInput,
-    account_id: AccountId,
-    wallet_core: &WalletCore,
-) -> Row {
-    let program = Program::new(elf.to_vec()).expect("parse program");
-    let serialized = Program::serialize_instruction(input.clone()).expect("serialize VerifyInput");
-    let accounts = vec![PrivacyPreservingAccount::PrivateOwned(account_id)];
+#[cfg(feature = "e2e")]
+mod e2e {
+    use std::time::Instant;
 
-    let t0 = Instant::now();
-    wallet_core
-        .send_privacy_preserving_tx(accounts, serialized, &program.into())
-        .await
-        .expect("send_privacy_preserving_tx");
-    let elapsed = t0.elapsed().as_secs_f64();
+    use lee::{
+        AccountId, privacy_preserving_transaction::circuit::ProgramCatalog, program::Program,
+    };
+    use lez_signature_bench::VerifyInput;
+    use program_loader_core::MAX_SEGMENT_DATA_LEN;
+    use wallet::{
+        AccountIdentity, WalletCore, WalletSequencerClient,
+        program_facades::program_loader::ProgramLoader,
+    };
 
-    Row {
-        scheme: label.to_string(),
-        n,
-        total_cycles: None,
-        user_cycles: None,
-        paging_cycles: None,
-        segments: None,
-        prove_seconds: None,
-        receipt_bytes: None,
-        exec_seconds: None,
-        tx_e2e_seconds: Some(elapsed),
+    use super::Row;
+
+    pub struct Deployed {
+        pub program_account_id: AccountId,
+        pub programs: ProgramCatalog,
     }
-}
 
-async fn run_row(
-    mode: Mode,
-    label: &str,
-    n: usize,
-    elf: &'static [u8],
-    input: &VerifyInput,
-    e2e: Option<(AccountId, &WalletCore)>,
-) -> Row {
-    if let Some((aid, wallet)) = e2e {
-        return run_e2e(label, n, elf, input, aid, wallet).await;
+    pub fn parse_account_id(s: &str) -> AccountId {
+        s.strip_prefix("Private/")
+            .or_else(|| s.strip_prefix("Public/"))
+            .unwrap_or(s)
+            .parse()
+            .expect("parse account id")
     }
-    match mode {
-        Mode::Public => run_public(label, n, elf, input),
-        _ => run_local(label, n, elf, input),
+
+    /// Deploys `elf` through `program_loader` into fresh header + segment
+    /// accounts, paid by `payer`. Mirrors LEZ's
+    /// `examples/program_deployment/src/lib.rs::deploy_program`.
+    pub async fn deploy<C: WalletSequencerClient>(
+        wallet: &mut WalletCore<C>,
+        elf: &'static [u8],
+        payer: AccountId,
+    ) -> Deployed {
+        let bytecode = elf.to_vec();
+        let segment_count = risc0_binfmt::ProgramBinary::decode(&bytecode)
+            .expect("program binary")
+            .user_elf
+            .len()
+            .div_ceil(MAX_SEGMENT_DATA_LEN);
+        let header = wallet.create_new_account_public(None).0;
+        let segments: Vec<AccountId> =
+            std::iter::repeat_with(|| wallet.create_new_account_public(None).0)
+                .take(segment_count)
+                .collect();
+        wallet.store_persistent_data().expect("store wallet");
+        let program_account_id = ProgramLoader(&*wallet)
+            .deploy(header, &segments, bytecode, true, Some(payer))
+            .await
+            .expect("program-loader deploy");
+        let program = Program::new(elf.into()).expect("parse program");
+        Deployed {
+            program_account_id,
+            programs: ProgramCatalog::from_iter([(program_account_id, program)]),
+        }
+    }
+
+    pub async fn run<C: WalletSequencerClient>(
+        label: &str,
+        n: usize,
+        deployed: &Deployed,
+        input: &VerifyInput,
+        account_id: AccountId,
+        wallet: &WalletCore<C>,
+    ) -> Row {
+        let message = Program::serialize_message(input.clone()).expect("serialize VerifyInput");
+        let account = AccountIdentity::PrivateOwned(account_id)
+            .select_program_actor_state(deployed.program_account_id);
+
+        let t0 = Instant::now();
+        wallet
+            .send_privacy_preserving_tx(vec![account], 0, message, &deployed.programs)
+            .await
+            .expect("send_privacy_preserving_tx");
+        let elapsed = t0.elapsed().as_secs_f64();
+
+        Row {
+            scheme: label.to_string(),
+            n,
+            total_cycles: None,
+            user_cycles: None,
+            paging_cycles: None,
+            segments: None,
+            prove_seconds: None,
+            receipt_bytes: None,
+            exec_seconds: None,
+            over_gas_cap: None,
+            tx_e2e_seconds: Some(elapsed),
+        }
     }
 }
 
@@ -232,14 +309,19 @@ fn print_row(r: &Row) {
     if let Some(s) = r.exec_seconds {
         let user = r.user_cycles.unwrap();
         println!(
-            "{:<22} n={} cycles(user/padded)={}/{} segs={} exec={:.4}s cap={:.1}%",
+            "{:<22} n={} cycles(user/padded)={}/{} segs={} exec={:.4}s gas_cap={:.1}%{}",
             r.scheme,
             r.n,
             user,
             r.total_cycles.unwrap(),
             r.segments.unwrap(),
             s,
-            100.0 * user as f64 / MAX_NUM_CYCLES_PUBLIC_EXECUTION as f64,
+            100.0 * user as f64 / MAX_GAS_EXEC as f64,
+            if r.over_gas_cap == Some(true) {
+                " OVER CAP (out of gas on chain)"
+            } else {
+                ""
+            },
         );
     } else if let Some(s) = r.tx_e2e_seconds {
         println!(
@@ -275,20 +357,25 @@ fn write_outputs(rows: &[Row], out_dir: &PathBuf, label: Option<&str>, mode: Mod
     let mut md = String::new();
     if mode == Mode::Public {
         md.push_str(
-            "| scheme | N | user cycles | padded cycles | segments | exec time | share of 32M cap |\n",
+            "| scheme | N | user cycles (gas) | padded cycles | segments | exec time | share of 10M gas cap |\n",
         );
         md.push_str("|---|---:|---:|---:|---:|---:|---:|\n");
         for r in rows {
             let user = r.user_cycles.unwrap_or(0);
             md.push_str(&format!(
-                "| `{}` | {} | {} | {} | {} | {:.1} ms | {:.1}% |\n",
+                "| `{}` | {} | {} | {} | {} | {:.1} ms | {:.1}%{} |\n",
                 r.scheme,
                 r.n,
                 user,
                 r.total_cycles.unwrap_or(0),
                 r.segments.unwrap_or(0),
                 1000.0 * r.exec_seconds.unwrap_or(0.0),
-                100.0 * user as f64 / MAX_NUM_CYCLES_PUBLIC_EXECUTION as f64,
+                100.0 * user as f64 / MAX_GAS_EXEC as f64,
+                if r.over_gas_cap == Some(true) {
+                    " (over cap)"
+                } else {
+                    ""
+                },
             ));
         }
     } else if mode == Mode::E2e {
@@ -334,12 +421,93 @@ fn write_outputs(rows: &[Row], out_dir: &PathBuf, label: Option<&str>, mode: Mod
     );
 }
 
-fn parse_account_id(s: &str) -> AccountId {
-    s.strip_prefix("Private/")
-        .or_else(|| s.strip_prefix("Public/"))
-        .unwrap_or(s)
-        .parse()
-        .expect("parse account_id")
+/// The (label, n, ELF, fixture) points to run: one, or the full matrix.
+fn cases(cli: &Cli) -> Vec<(String, usize, &'static [u8], VerifyInput)> {
+    if cli.all {
+        let mut cases = vec![(
+            "noop".to_string(),
+            1,
+            NOOP_ELF,
+            make_test_vector(Scheme::EcdsaSecp256k1, 1),
+        )];
+        for &scheme in Scheme::ALL {
+            for &n in &cli.ns {
+                cases.push((
+                    scheme.slug().to_string(),
+                    n,
+                    elf_for(scheme),
+                    make_test_vector(scheme, n),
+                ));
+            }
+        }
+        return cases;
+    }
+    let scheme_str = cli
+        .scheme
+        .as_deref()
+        .expect("--scheme required without --all");
+    let n = cli.n.expect("--n required without --all");
+    if scheme_str == "noop" {
+        let fixture = Scheme::parse(&cli.noop_fixture).expect("noop fixture");
+        let label = if fixture == Scheme::EcdsaSecp256k1 {
+            "noop".to_string()
+        } else {
+            format!("noop[{}]", fixture.slug())
+        };
+        vec![(label, n, NOOP_ELF, make_test_vector(fixture, n))]
+    } else {
+        let scheme = Scheme::parse(scheme_str).expect("scheme");
+        vec![(
+            scheme.slug().to_string(),
+            n,
+            elf_for(scheme),
+            make_test_vector(scheme, n),
+        )]
+    }
+}
+
+#[cfg(feature = "e2e")]
+async fn run_e2e_cases(
+    cli: &Cli,
+    cases: &[(String, usize, &'static [u8], VerifyInput)],
+) -> Vec<Row> {
+    let account_id = e2e::parse_account_id(cli.account_id.as_deref().expect("--account-id"));
+    let payer = e2e::parse_account_id(
+        cli.payer
+            .as_deref()
+            .expect("--payer <funded public account> required with --account-id"),
+    );
+    let mut wallet =
+        wallet::WalletCore::from_env().expect("WalletCore from env (set LEE_WALLET_HOME_DIR)");
+
+    // Deploy each distinct guest once, before any timed transaction.
+    let mut deployed: Vec<(&'static [u8], e2e::Deployed)> = Vec::new();
+    for (label, _, elf, _) in cases {
+        if !deployed.iter().any(|(e, _)| std::ptr::eq(*e, *elf)) {
+            eprintln!("deploying {label} …");
+            deployed.push((elf, e2e::deploy(&mut wallet, elf, payer).await));
+        }
+    }
+
+    let mut rows = Vec::new();
+    for (label, n, elf, input) in cases {
+        let (_, d) = deployed
+            .iter()
+            .find(|(e, _)| std::ptr::eq(*e, *elf))
+            .expect("deployed");
+        let row = e2e::run(label, *n, d, input, account_id, &wallet).await;
+        print_row(&row);
+        rows.push(row);
+    }
+    rows
+}
+
+#[cfg(not(feature = "e2e"))]
+async fn run_e2e_cases(
+    _cli: &Cli,
+    _cases: &[(String, usize, &'static [u8], VerifyInput)],
+) -> Vec<Row> {
+    panic!("--account-id needs the `e2e` feature (build without --no-default-features)");
 }
 
 #[tokio::main]
@@ -357,81 +525,25 @@ async fn main() {
     } else {
         Mode::Prove
     };
-    let wallet_core = if mode == Mode::E2e {
-        Some(WalletCore::from_env().expect("WalletCore from env (set NSSA_WALLET_HOME_DIR)"))
+    let cases = cases(&cli);
+    let rows = if mode == Mode::E2e {
+        run_e2e_cases(&cli, &cases).await
     } else {
-        None
+        cases
+            .iter()
+            .map(|(label, n, elf, input)| {
+                let row = if mode == Mode::Public {
+                    run_public(label, *n, elf, input)
+                } else {
+                    run_local(label, *n, elf, input)
+                };
+                print_row(&row);
+                row
+            })
+            .collect()
     };
-    let account_id = cli.account_id.as_deref().map(parse_account_id);
 
     if cli.all {
-        let mut rows: Vec<Row> = Vec::new();
-
-        let baseline_input = make_test_vector(Scheme::EcdsaSecp256k1, 1);
-        let row = run_row(
-            mode,
-            "noop",
-            1,
-            NOOP_ELF,
-            &baseline_input,
-            account_id.zip(wallet_core.as_ref()),
-        )
-        .await;
-        print_row(&row);
-        rows.push(row);
-
-        for &scheme in Scheme::ALL {
-            let elf = elf_for(scheme);
-            for &n in &cli.ns {
-                let input = make_test_vector(scheme, n);
-                let row = run_row(
-                    mode,
-                    scheme.slug(),
-                    n,
-                    elf,
-                    &input,
-                    account_id.zip(wallet_core.as_ref()),
-                )
-                .await;
-                print_row(&row);
-                rows.push(row);
-            }
-        }
-
         write_outputs(&rows, &cli.out_dir, cli.label.as_deref(), mode);
-    } else {
-        let scheme_str = cli
-            .scheme
-            .as_deref()
-            .expect("--scheme required without --all");
-        let n = cli.n.expect("--n required without --all");
-
-        let (label, elf, input) = if scheme_str == "noop" {
-            let fixture = Scheme::parse(&cli.noop_fixture).expect("noop fixture");
-            let label = if fixture == Scheme::EcdsaSecp256k1 {
-                "noop".to_string()
-            } else {
-                format!("noop[{}]", fixture.slug())
-            };
-            (label, NOOP_ELF, make_test_vector(fixture, n))
-        } else {
-            let scheme = Scheme::parse(scheme_str).expect("scheme");
-            (
-                scheme.slug().to_string(),
-                elf_for(scheme),
-                make_test_vector(scheme, n),
-            )
-        };
-
-        let row = run_row(
-            mode,
-            &label,
-            n,
-            elf,
-            &input,
-            account_id.zip(wallet_core.as_ref()),
-        )
-        .await;
-        print_row(&row);
     }
 }
